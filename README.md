@@ -1,4 +1,4 @@
-# SeqAbDesign: a sequence-based framework for antigen-specific antibody design
+# SPACE: A Unified Framework for Multi-Constraint Antigen-Specific Antibody Design Operating in Sequence Space
 
 A sequence-driven closed-loop framework for antigen-specific antibody design that integrates:
 - Antigen-conditioned CDRH3 generation
