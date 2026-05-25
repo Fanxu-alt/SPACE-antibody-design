@@ -7,7 +7,7 @@ A sequence-driven closed-loop framework for antigen-specific antibody design tha
 - Interactive Gradio Web Application
   
 <p align="center">
-  <img src="data/raw/fig1.png" width="700">
+  <img src="data/raw/fig.png" width="700">
 </p>
 
 ## Framework Architecture
