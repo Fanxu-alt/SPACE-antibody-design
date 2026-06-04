@@ -55,9 +55,9 @@ df["cdrh3_len"] = cdrh3_lens
 
 df.to_csv(output_file, index=False)
 
-print("原始样本:", len(df))
-print("成功提取 CDRH3:", df["cdrh3_seq"].notna().sum())
-print("失败:", df["cdrh3_seq"].isna().sum())
-print("保存:", output_file)
+print("Original sample:", len(df))
+print("successfully extracted CDRH3:", df["cdrh3_seq"].notna().sum())
+print("fail:", df["cdrh3_seq"].isna().sum())
+print("save:", output_file)
 
 print(df[["pdb", "antigen_group", "cdrh3_seq", "cdrh3_len"]].head())
