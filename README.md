@@ -27,39 +27,12 @@ python code/train/train_cdrh3_vae.py
 python code/train/train_conditional_cvae.py
 python code/train/train_esm2_cross_attention.py
 ```
-### Web Application
 
-We extend the framework into a goal-oriented antibody design agent.
+### Online Web Application
 
-Given:
-- an antigen sequence,
-- a heavy-chain template,
-- a CDRH3 template,
-- and user-defined design constraints,
+website: https://antibody-design.vercel.app
 
-the agent automatically:
-- generates candidate CDRH3 sequences,
-- predicts antibody–antigen binding,
-- filters and ranks candidates using developability criteria,
-- and iterates until the design requirements are met.
-
-### Launch locally
-
-```bash
-python Antibody_Design_Application/app_gradio.py
-```
-
-Open:
-
-```bash
-http://127.0.0.1:7860
-```
-
-### Online demo
-
-A public online demo is available at:
-
-https://huggingface.co/spaces/Fanxu-alt/Antibody-Design-App
+The backend is implemented using FastAPI and deployed on Hugging Face Spaces.
 
 ## Pretrained Models
 
@@ -99,12 +72,6 @@ After downloading, place the checkpoints in the `checkpoints/` directory.
 - gradio
 - gradio_client
 - ANARCI (for CDRH3 extraction)
-
-## Online Web Application
-
-website: https://antibody-design.vercel.app
-
-The backend is implemented using FastAPI and deployed on Hugging Face Spaces.
 
 ## Dataset: covid_human_heavy_cdr3_aa_unique_len4_30.txt
 
