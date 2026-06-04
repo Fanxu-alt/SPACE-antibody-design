@@ -120,7 +120,7 @@ We also collected antibody–antigen complex structures from the SAbDab database
 All antigen-specific datasets are available under:
 
 ```bash
-H3-AbSeqVAE/data/raw/
+data/raw/
 ```
 
 For each complex, the IMGT-numbered CDRH3 region were extracted. Negative samples were generated using a dissimilarity-based negative sampling strategy (sequence identity threshold of less than 60%).
