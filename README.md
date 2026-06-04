@@ -116,11 +116,12 @@ Download: https://drive.google.com/file/d/1n46ld31QrC9oYlZVsR7JZsoOgX_TFupc/view
 ## Dataset Construction
 We also collected antibody–antigen complex structures from the SAbDab database: HIV gp120, Influenza Hemagglutinin (HA), HIV gp160, Plasmodium Circumsporozoite Protein (CSP), Influenza Neuraminidase (NA).
 
-```markdown
+
 All antigen-specific datasets are available under:
 
 ```bash
 H3-AbSeqVAE/data/raw/
+```
 
 For each complex, the IMGT-numbered CDRH3 region were extracted. Negative samples were generated using a dissimilarity-based negative sampling strategy (sequence identity threshold of less than 60%).
 
