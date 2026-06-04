@@ -100,6 +100,12 @@ After downloading, place the checkpoints in the `checkpoints/` directory.
 - gradio_client
 - ANARCI (for CDRH3 extraction)
 
+## Online Web Application
+
+website: https://antibody-design.vercel.app
+
+The backend is implemented using FastAPI and deployed on Hugging Face Spaces.
+
 ## Dataset: covid_human_heavy_cdr3_aa_unique_len4_30.txt
 
 This file contains a non-redundant collection of human SARS-CoV-2-associated heavy-chain CDRH3 amino acid sequences curated from the Observed Antibody Space (OAS) database.
