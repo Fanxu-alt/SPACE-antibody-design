@@ -1,22 +1,22 @@
 # SPACE: A Unified Framework for Multi-Constraint Antigen-Specific Antibody Design Operating in Sequence Space
 
-A sequence-driven closed-loop framework for antigen-specific antibody design that integrates:
+A sequence-based framework for antigen-specific antibody design integrating:
 - Antigen-conditioned CDRH3 generation
 - Sequence-based antibody–antigen interaction prediction
 - Developability-aware candidate prioritization
-- Interactive Gradio Web Application
   
 <p align="center">
   <img src="data/raw/fig.png" width="700">
 </p>
 
 ## Framework Architecture
-Antigen sequence  
-→ Conditional VAE (CDRH3 generation)  
-→ Generated CDRH3 candidates  
-→ ESM-2 Cross-Attention Model (binding prediction)  
-→ Developability-aware ranking  
-→ Final antibody candidates
+
+1. VAE Pretraining
+2. Conditional VAE Fine-tuning
+3. Binding Model Training
+4. Antibody Generation
+5. Binding Prediction
+6. Developability Assessment
 
 ## Hardware Requirements
 ### Recommended
