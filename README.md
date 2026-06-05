@@ -62,15 +62,17 @@ After downloading, place the checkpoints in the `checkpoints/` directory.
 - Python ≥ 3.9
 
 ### Dependencies
+- fastapi
+- uvicorn
+- pydantic
+- pandas
+- numpy
 - torch
 - Transformers ≥ 4.30
 - scikit-learn
-- pandas
-- numpy
 - matplotlib
 - seaborn
-- gradio
-- gradio_client
+- openai
 - ANARCI (for CDRH3 extraction)
 
 ## Dataset: covid_human_heavy_cdr3_aa_unique_len4_30.txt
