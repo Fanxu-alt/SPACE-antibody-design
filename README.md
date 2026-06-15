@@ -6,7 +6,7 @@ A sequence-based framework for antigen-specific antibody design integrating:
 - Developability-aware candidate prioritization
   
 <p align="center">
-  <img src="data/raw/fig.png" width="700">
+  <img src="data/raw/fig1.png" width="700">
 </p>
 
 ## Framework Architecture
