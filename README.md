@@ -1,35 +1,57 @@
 # SPACE-antibody-design
 
-Implementation of
+Implementation of the framework described in:
 
-SPACE: A Unified Framework for Multi-Constraint Antigen-Specific Antibody Design Operating in Sequence Space
+**SPACE: A Unified Framework for Multi-Constraint Antigen-Specific Antibody Design Operating in Sequence Space**
 
-SPACE consists of:
+SPACE is a sequence-based platform for antigen-specific antibody design that integrates:
 
-- H3-AbSeqVAE (antigen-conditioned CDRH3 generation)
-- AbAgBinder (antibody-antigen interaction prediction)
-- Developability-aware candidate prioritization
-  
+- **H3-AbSeqVAE**: antigen-conditioned CDRH3 sequence generation
+- **AbAgBinder**: antibody–antigen interaction prediction
+- **Developability-aware screening**: candidate prioritization using sequence-derived developability metrics
+
 <p align="center">
-  <img src="data/raw/fig1.png" width="700">
+  <img src="data/raw/fig1.png" width="800">
 </p>
 
-## Framework Architecture
+## Framework Overview
 
-1. VAE Pretraining
-2. Conditional VAE Fine-tuning
-3. Binding Model Training
-4. Antibody Generation
-5. Binding Prediction
-6. Developability Assessment
+SPACE consists of three major components:
+
+### 1. Repertoire-informed CDRH3 Generation
+
+- VAE pretraining on large-scale antibody repertoires
+- Antigen-conditioned CVAE fine-tuning
+
+### 2. Antibody–Antigen Interaction Prediction
+
+- ESM2 protein language model embeddings
+- Bidirectional cross-attention modeling
+
+### 3. Developability-aware Candidate Prioritization
+
+- Rule-based liability filtering
+- Multi-objective ranking based on binding and developability
 
 ## Quick Start
 
-### Train models
+### Train Models
+
+Train the repertoire VAE:
 
 ```bash
 python code/train/train_cdrh3_vae.py
+```
+
+Train the antigen-conditioned CVAE:
+
+```bash
 python code/train/train_conditional_cvae.py
+```
+
+Train AbAgBinder:
+
+```bash
 python code/train/train_esm2_cross_attention.py
 ```
 
