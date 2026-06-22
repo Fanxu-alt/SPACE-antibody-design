@@ -57,78 +57,128 @@ python code/train/train_esm2_cross_attention.py
 
 ### Online Web Application
 
-website: https://antibody-design.vercel.app
-
-The backend is implemented using FastAPI and deployed on Hugging Face Spaces.
+https://antibody-design.vercel.app
 
 ## Pretrained Models
 
-The checkpoint provided in this repository:
-```bash
+The repository includes:
+
+```text
 checkpoints/best_esm2_cross_attention.pt
 ```
-was trained using the small ESM2 model (esm2_t12_35M_UR50D) for demonstration and reproducibility.
 
-Due to file size limitations, checkpoints trained with larger ESM2 models (esm2_t33_650M_UR50D) are hosted on Google Drive:
+This checkpoint was trained using:
 
-Download larger pretrained models (best_esm2_cross_attention_regression_fixed_antigen.pt, best_esm2_cross_attention_regression.pt, best_esm2_cross_attention.pt): 
+```text
+esm2_t12_35M_UR50D
+```
 
-https://drive.google.com/file/d/14ZK1tzs6QaPVj8i74B2Rzhb3JpxOE25r/view?usp=drive_link, https://drive.google.com/file/d/1ZZQzJYHQ37Zc1KjwqAsiiYMyB8yyORGY/view?usp=drive_link, https://drive.google.com/file/d/1SdkpORkcsUErk5c2iiNBYlkyTVKrbPLN/view?usp=drive_link.
+for demonstration and reproducibility purposes.
 
-After downloading, place the checkpoints in the `checkpoints/` directory.
+Larger checkpoints trained with:
+
+```text
+esm2_t33_650M_UR50D
+```
+
+are available through Google Drive:
+
+- best_esm2_cross_attention.pt
+- best_esm2_cross_attention_regression.pt
+- best_esm2_cross_attention_regression_fixed_antigen.pt
+
+Downloads:
+
+- https://drive.google.com/file/d/14ZK1tzs6QaPVj8i74B2Rzhb3JpxOE25r/view?usp=drive_link,
+- https://drive.google.com/file/d/1ZZQzJYHQ37Zc1KjwqAsiiYMyB8yyORGY/view?usp=drive_link,
+- https://drive.google.com/file/d/1SdkpORkcsUErk5c2iiNBYlkyTVKrbPLN/view?usp=drive_link.
+
+After downloading, place the files in:
+
+```text
+checkpoints/
+```
 
 ## Hardware Requirements
-### Recommended
-- GPU: NVIDIA A100
-- CPU: ≥8 cores
-- RAM: ≥32 GB
-- Storage: ≥20 GB
 
-### System Requirements
-- OS: Ubuntu 20.04 / Linux / macOS
+### Recommended
+
+- GPU: NVIDIA A100
+- CPU: ≥ 8 cores
+- RAM: ≥ 32 GB
+- Storage: ≥ 20 GB
+
+### Software Requirements
+
+- Ubuntu 20.04 / Linux / macOS
 - Python ≥ 3.9
 
-### Dependencies
-- fastapi
-- uvicorn
-- pydantic
-- pandas
-- numpy
-- torch
+
+### Main Dependencies
+
+- PyTorch
 - Transformers ≥ 4.30
-- scikit-learn
-- matplotlib
-- seaborn
-- openai
+- FastAPI
+- Uvicorn
+- NumPy
+- Pandas
+- Scikit-learn
+- Matplotlib
+- Seaborn
+- OpenAI API
 - ANARCI (for CDRH3 extraction)
 
-## Dataset: covid_human_heavy_cdr3_aa_unique_len4_30.txt
+## Dataset Availability
 
-This file contains a non-redundant collection of human SARS-CoV-2-associated heavy-chain CDRH3 amino acid sequences curated from the Observed Antibody Space (OAS) database.
+### Repertoire Pretraining Dataset
 
-### Description
-- **Processing steps**: 
-  1. removed empty entries
-  2. removed sequences containing non-canonical amino acid characters
-  3. removed duplicate sequences globally across all files
-  4. retained only sequences with lengths between **4 and 30 amino acids**
-     
-Download: https://drive.google.com/file/d/1n46ld31QrC9oYlZVsR7JZsoOgX_TFupc/view?usp=drive_link.
+The file:
 
-## Dataset Construction
-We also collected antibody–antigen complex structures from the SAbDab database: HIV gp120, Influenza Hemagglutinin (HA), HIV gp160, Plasmodium Circumsporozoite Protein (CSP), Influenza Neuraminidase (NA).
+```text
+covid_human_heavy_cdr3_aa_unique_len4_30.txt
+```
 
+contains a non-redundant collection of human SARS-CoV-2-associated heavy-chain CDRH3 sequences derived from the Observed Antibody Space (OAS) database.
 
-All antigen-specific datasets are available under:
+Processing steps:
 
-```bash
+1. Removal of empty entries
+2. Removal of non-canonical amino acid characters
+3. Global deduplication
+4. Retention of sequences between 4 and 30 amino acids
+
+Download:
+
+https://drive.google.com/file/d/1n46ld31QrC9oYlZVsR7JZsoOgX_TFupc/view?usp=drive_link.
+
+### Antigen-Specific Datasets
+
+Antibody–antigen complexes were collected from the SAbDab database for:
+
+- HIV gp120
+- HIV gp160
+- Influenza Hemagglutinin (HA)
+- Influenza Neuraminidase (NA)
+- Plasmodium Circumsporozoite Protein (CSP)
+
+Processed datasets are available under:
+
+```text
 data/raw/
 ```
 
-For each complex, the IMGT-numbered CDRH3 region was extracted. Negative samples were generated using a dissimilarity-based negative sampling strategy (sequence identity threshold of less than 60%).
+For each complex, IMGT-numbered CDRH3 sequences were extracted.
 
-### Contact
+Negative samples were generated using a dissimilarity-based sampling strategy with a sequence identity threshold below 60%.
 
-If you have any questions about this repository, please contact:
+## License
 
-**[Fanxu Meng](mailto:f.meng@vu.nl)**
+This project is released under the MIT License.
+
+See the LICENSE file for details.
+
+## Contact
+
+**Fanxu Meng**
+
+Email: f.meng@vu.nl
