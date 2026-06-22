@@ -103,7 +103,7 @@ All antigen-specific datasets are available under:
 data/raw/
 ```
 
-For each complex, the IMGT-numbered CDRH3 region were extracted. Negative samples were generated using a dissimilarity-based negative sampling strategy (sequence identity threshold of less than 60%).
+For each complex, the IMGT-numbered CDRH3 region was extracted. Negative samples were generated using a dissimilarity-based negative sampling strategy (sequence identity threshold of less than 60%).
 
 ### Contact
 
