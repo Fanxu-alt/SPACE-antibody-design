@@ -54,9 +54,7 @@ AROMATIC = set("FWY")
 ABS_THRESHOLDS = {
     "cdr3_len_min": 8,
     "cdr3_len_max": 20,
-    "extra_cys_heavy_max": 0,
     "extra_cys_cdr3_max": 0,
-    "n_glyco_motif_heavy_max": 0,
     "n_glyco_motif_cdr3_max": 0,
     "deamidation_motif_cdr3_max": 1,
     "isomerization_motif_cdr3_max": 1,
@@ -320,14 +318,9 @@ def hard_filter_rule_row(row: pd.Series) -> Tuple[bool, List[str]]:
     if not (ABS_THRESHOLDS["cdr3_len_min"] <= row["cdr3_len"] <= ABS_THRESHOLDS["cdr3_len_max"]):
         reasons.append("CDRH3 length outside allowed range")
 
-    if row["heavy_extra_cys_proxy"] > ABS_THRESHOLDS["extra_cys_heavy_max"]:
-        reasons.append("extra cysteine(s) in heavy chain")
-
+    
     if row["cdr3_extra_cys_proxy"] > ABS_THRESHOLDS["extra_cys_cdr3_max"]:
         reasons.append("cysteine present in CDRH3")
-
-    if row["heavy_n_glyco_motifs"] > ABS_THRESHOLDS["n_glyco_motif_heavy_max"]:
-        reasons.append("N-linked glycosylation motif in heavy chain")
 
     if row["cdr3_n_glyco_motifs"] > ABS_THRESHOLDS["n_glyco_motif_cdr3_max"]:
         reasons.append("N-linked glycosylation motif in CDRH3")
