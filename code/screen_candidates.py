@@ -349,11 +349,9 @@ def hard_filter_rule_row(row: pd.Series) -> Tuple[bool, List[str]]:
 def relative_risk_score(df: pd.DataFrame) -> pd.Series:
     score = pd.Series(np.zeros(len(df)), index=df.index, dtype=float)
 
-    score += 3.0 * df["heavy_n_glyco_motifs"]
     score += 4.0 * df["cdr3_n_glyco_motifs"]
     score += 2.0 * df["cdr3_deamidation_motifs"]
     score += 2.0 * df["cdr3_isomerization_motifs"]
-    score += 3.0 * df["heavy_extra_cys_proxy"]
     score += 4.0 * df["cdr3_extra_cys_proxy"]
     score += 0.75 * df["cdr3_oxidation_m_count"]
 
@@ -363,11 +361,9 @@ def relative_risk_score(df: pd.DataFrame) -> pd.Series:
         "cdr3_max_window_gravy_5",
         "cdr3_max_window_abs_charge_5",
         "cdr3_len",
-        "heavy_n_glyco_motifs",
         "cdr3_n_glyco_motifs",
         "cdr3_deamidation_motifs",
         "cdr3_isomerization_motifs",
-        "heavy_extra_cys_proxy",
         "cdr3_extra_cys_proxy",
     ]
 
