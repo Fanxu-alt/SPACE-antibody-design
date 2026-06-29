@@ -11,7 +11,7 @@ SPACE is a sequence-based platform for antigen-specific antibody design that int
 - **Developability-aware screening**: candidate prioritization using sequence-derived developability metrics
 
 <p align="center">
-  <img src="data/raw/fig1.png" width="800">
+  <img src="data/raw/1.png" width="800">
 </p>
 
 ## Framework Overview
