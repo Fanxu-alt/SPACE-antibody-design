@@ -18,7 +18,7 @@ from sklearn.metrics import (
 
 from transformers import AutoTokenizer, AutoModel
 
-# Config
+
 
 @dataclass
 class Config:
@@ -51,7 +51,6 @@ class Config:
 
 cfg = Config()
 
-# Utils
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -121,8 +120,6 @@ class PairDataset(Dataset):
             "label": float(label),
         }
 
-# Collator
-# ESM tokenization expects amino acids separated by spaces
 
 class PairCollator:
     def __init__(self, tokenizer, max_heavy_len, max_antigen_len):
@@ -163,7 +160,6 @@ class PairCollator:
             "labels": labels,
         }
 
-# Cross Attention Block
 
 class CrossAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads=8, dropout=0.1):
@@ -188,7 +184,6 @@ class CrossAttentionBlock(nn.Module):
         out = self.norm(query + self.dropout(out))
         return out, attn_weights
 
-# Model
 
 class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
     def __init__(self, model_name, hidden_dim=256, num_heads=8, dropout=0.1):
@@ -197,7 +192,6 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.esm = AutoModel.from_pretrained(model_name)
 
-        # Freeze ESM2 parameters
         for p in self.esm.parameters():
             p.requires_grad = False
 
@@ -251,14 +245,12 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_key_padding_mask = (antigen_attention_mask == 0)
         heavy_key_padding_mask = (heavy_attention_mask == 0)
 
-        # Heavy attends to antigen
         heavy_ctx, heavy_to_antigen_attn = self.ab_to_ag(
             query=heavy_emb,
             key_value=antigen_emb,
             key_padding_mask=antigen_key_padding_mask,
         )
 
-        # Antigen attends to heavy
         antigen_ctx, antigen_to_heavy_attn = self.ag_to_ab(
             query=antigen_emb,
             key_value=heavy_emb,
@@ -285,7 +277,6 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_input_ids,
         antigen_attention_mask,
     ):
-        # training/eval path: no gradients through frozen ESM
         with torch.no_grad():
             heavy_emb = self.encode_from_ids(heavy_input_ids, heavy_attention_mask)
             antigen_emb = self.encode_from_ids(antigen_input_ids, antigen_attention_mask)
@@ -304,7 +295,7 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_inputs_embeds,
         antigen_attention_mask,
     ):
-        # attribution path: allow gradients wrt input embeddings
+       
         heavy_emb = self.encode_from_embeds(heavy_inputs_embeds, heavy_attention_mask)
         antigen_emb = self.encode_from_embeds(antigen_inputs_embeds, antigen_attention_mask)
 
@@ -315,7 +306,6 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
             antigen_attention_mask=antigen_attention_mask,
         )
 
-# Metrics
 
 def compute_metrics(labels, probs, threshold=0.5):
     labels = np.array(labels).astype(int)
@@ -330,7 +320,6 @@ def compute_metrics(labels, probs, threshold=0.5):
 
     return metrics
 
-# Train / Eval
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
@@ -401,7 +390,6 @@ def evaluate(model, loader, criterion, device):
     metrics = compute_metrics(all_labels, all_probs)
     return total_loss / len(loader), metrics
 
-# Attribution helpers
 
 def add_spaces(seq: str) -> str:
     return " ".join(list(seq.strip().upper()))
@@ -440,7 +428,6 @@ def extract_residue_tokens_and_scores(
         if mask_val == 0:
             continue
 
-    # Skip special tokens
         if tok in tokenizer.all_special_tokens:
             continue
 
@@ -554,9 +541,8 @@ def attribute_positive_probability_to_input_embeddings(
     pos_prob = torch.sigmoid(logits)[0]
     pos_prob.backward()
 
-    heavy_grads = heavy_inputs_embeds.grad[0]      # [Lh, D]
-    antigen_grads = antigen_inputs_embeds.grad[0]  # [La, D]
-
+    heavy_grads = heavy_inputs_embeds.grad[0]      
+    antigen_grads = antigen_inputs_embeds.grad[0]  
     heavy_embeds_0 = heavy_inputs_embeds.detach()[0]
     antigen_embeds_0 = antigen_inputs_embeds.detach()[0]
 
@@ -625,7 +611,6 @@ def save_residue_importance_csv(residue_scores: List[Dict], out_csv: str):
     df.to_csv(out_csv, index=False)
     print(f"Saved attribution scores to: {out_csv}")
 
-# Main training
 
 def train_main():
     set_seed(cfg.seed)
@@ -729,7 +714,6 @@ def train_main():
             )
             print(f"Saved best model to {cfg.save_path}")
 
-# Load trained model
 
 def load_trained_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -753,7 +737,6 @@ def load_trained_model(checkpoint_path: str, device: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     return model, tokenizer, ckpt
 
-# Example attribution run
 
 def attribution_demo(
     checkpoint_path: str,
@@ -810,15 +793,9 @@ def attribution_demo(
 
     return attr
 
-# Main entry
 
 if __name__ == "__main__":
  
     demo_heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFTVSDNYMSWVRQAPGKGLQWVSVIYSGGNTYYADFVKGRFNITRDDSKNMLYLQMNSLRREDTAVYYCVRDRRIVGYYFGLDVWGQGTTVTVFS"
     demo_antigen = "RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNF"
-    # attribution_demo(
-    #     checkpoint_path=cfg.save_path,
-    #     heavy_seq=demo_heavy,
-    #     antigen_seq=demo_antigen,
-    #     score_mode="grad_x_input",   # or "grad_norm"
-    # )
+    
