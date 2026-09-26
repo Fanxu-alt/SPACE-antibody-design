@@ -1,14 +1,15 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
 
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score,
     f1_score,
@@ -19,13 +20,14 @@ from sklearn.metrics import (
 from transformers import AutoTokenizer, AutoModel
 
 
-
 @dataclass
 class Config:
+
     csv_path: str = "CoV-AbDab.csv"
     heavy_col: str = "Heavy"
     antigen_col: str = "antigen"
     label_col: str = "Label"
+
 
     model_name: str = "facebook/esm2_t6_8M_UR50D"
 
@@ -41,58 +43,109 @@ class Config:
     hidden_dim: int = 256
     dropout: float = 0.1
 
-    val_ratio: float = 0.1
-    seed: int = 42
-    num_workers: int = 0
+    train_ratio: float = 0.80
+    val_ratio: float = 0.10
+    test_ratio: float = 0.10
 
+    num_runs: int = 5
+    base_seed: int = 42
+
+  
+    num_workers: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_path: str = "best_esm2_cross_attention.pt"
+
+   
+    output_dir: str = "results"
 
 
 cfg = Config()
 
 
 def set_seed(seed: int):
+
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def masked_mean(x, mask):
+
     # x: [B, L, D]
-    # mask: [B, L], 1 valid / 0 pad
+    # mask: [B, L]
+
     mask = mask.unsqueeze(-1).float()
+
     x = x * mask
+
     return x.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
 
 def safe_auc(labels, probs):
+
     try:
         return roc_auc_score(labels, probs)
+
     except ValueError:
         return float("nan")
 
-# Dataset
+
+
 
 class PairDataset(Dataset):
-    def __init__(self, csv_path, heavy_col, antigen_col, label_col):
+
+    def __init__(
+        self,
+        csv_path,
+        heavy_col,
+        antigen_col,
+        label_col,
+    ):
+
         df = pd.read_csv(csv_path)
 
         for col in [heavy_col, antigen_col, label_col]:
+
             if col not in df.columns:
-                raise ValueError(f"Column '{col}' not found in {csv_path}")
 
-        df = df[[heavy_col, antigen_col, label_col]].dropna().copy()
+                raise ValueError(
+                    f"Column '{col}' not found in {csv_path}"
+                )
 
-        df[heavy_col] = df[heavy_col].astype(str).str.strip().str.upper()
-        df[antigen_col] = df[antigen_col].astype(str).str.strip().str.upper()
-        df[label_col] = pd.to_numeric(df[label_col], errors="coerce")
+        df = df[
+            [heavy_col, antigen_col, label_col]
+        ].dropna().copy()
+
+        df[heavy_col] = (
+            df[heavy_col]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+        df[antigen_col] = (
+            df[antigen_col]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+        df[label_col] = pd.to_numeric(
+            df[label_col],
+            errors="coerce",
+        )
+
         df = df.dropna().copy()
+
         df[label_col] = df[label_col].astype(int)
 
         df = df[
-            (df[heavy_col].str.len() > 0) &
+            (df[heavy_col].str.len() > 0)
+            &
             (df[antigen_col].str.len() > 0)
         ].reset_index(drop=True)
 
@@ -100,41 +153,75 @@ class PairDataset(Dataset):
             zip(
                 df[heavy_col].tolist(),
                 df[antigen_col].tolist(),
-                df[label_col].tolist()
+                df[label_col].tolist(),
             )
         )
 
         if len(self.samples) == 0:
-            raise ValueError("No valid samples after filtering.")
 
-        print(f"Loaded {len(self.samples)} samples")
+            raise ValueError(
+                "No valid samples after filtering."
+            )
+
+        print(
+            f"Loaded {len(self.samples)} samples"
+        )
 
     def __len__(self):
+
         return len(self.samples)
 
     def __getitem__(self, idx):
+
         heavy, antigen, label = self.samples[idx]
+
         return {
+
             "heavy": heavy,
+
             "antigen": antigen,
+
             "label": float(label),
         }
 
 
+
 class PairCollator:
-    def __init__(self, tokenizer, max_heavy_len, max_antigen_len):
+
+    def __init__(
+        self,
+        tokenizer,
+        max_heavy_len,
+        max_antigen_len,
+    ):
+
         self.tokenizer = tokenizer
+
         self.max_heavy_len = max_heavy_len
+
         self.max_antigen_len = max_antigen_len
 
     @staticmethod
     def add_spaces(seq: str) -> str:
+
         return " ".join(list(seq))
 
     def __call__(self, batch):
-        heavy_texts = [self.add_spaces(item["heavy"]) for item in batch]
-        antigen_texts = [self.add_spaces(item["antigen"]) for item in batch]
-        labels = torch.tensor([item["label"] for item in batch], dtype=torch.float32)
+
+        heavy_texts = [
+            self.add_spaces(item["heavy"])
+            for item in batch
+        ]
+
+        antigen_texts = [
+            self.add_spaces(item["antigen"])
+            for item in batch
+        ]
+
+        labels = torch.tensor(
+            [item["label"] for item in batch],
+            dtype=torch.float32,
+        )
 
         heavy_inputs = self.tokenizer(
             heavy_texts,
@@ -153,46 +240,102 @@ class PairCollator:
         )
 
         return {
-            "heavy_input_ids": heavy_inputs["input_ids"],
-            "heavy_attention_mask": heavy_inputs["attention_mask"],
-            "antigen_input_ids": antigen_inputs["input_ids"],
-            "antigen_attention_mask": antigen_inputs["attention_mask"],
-            "labels": labels,
+
+            "heavy_input_ids":
+                heavy_inputs["input_ids"],
+
+            "heavy_attention_mask":
+                heavy_inputs["attention_mask"],
+
+            "antigen_input_ids":
+                antigen_inputs["input_ids"],
+
+            "antigen_attention_mask":
+                antigen_inputs["attention_mask"],
+
+            "labels":
+                labels,
         }
 
 
+
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, dropout=0.1):
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        dropout=0.1,
+    ):
+
         super().__init__()
+
         self.attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
+
         self.norm = nn.LayerNorm(dim)
+
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query, key_value, key_padding_mask=None):
+    def forward(
+        self,
+        query,
+        key_value,
+        key_padding_mask=None,
+    ):
+
         out, attn_weights = self.attn(
+
             query=query,
+
             key=key_value,
+
             value=key_value,
-            key_padding_mask=key_padding_mask,   # True means ignore
+
+            key_padding_mask=key_padding_mask,
+
             need_weights=True,
         )
-        out = self.norm(query + self.dropout(out))
+
+        out = self.norm(
+            query + self.dropout(out)
+        )
+
         return out, attn_weights
 
 
+
 class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
-    def __init__(self, model_name, hidden_dim=256, num_heads=8, dropout=0.1):
+
+    def __init__(
+        self,
+        model_name,
+        hidden_dim=256,
+        num_heads=8,
+        dropout=0.1,
+    ):
+
         super().__init__()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.esm = AutoModel.from_pretrained(model_name)
+        self.tokenizer = (
+            AutoTokenizer.from_pretrained(
+                model_name
+            )
+        )
 
+        self.esm = (
+            AutoModel.from_pretrained(
+                model_name
+            )
+        )
+
+ 
         for p in self.esm.parameters():
+
             p.requires_grad = False
 
         esm_dim = self.esm.config.hidden_size
@@ -202,38 +345,74 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
+
         self.ag_to_ab = CrossAttentionBlock(
             dim=esm_dim,
             num_heads=num_heads,
             dropout=dropout,
         )
 
-        self.ab_proj = nn.Linear(esm_dim, hidden_dim)
-        self.ag_proj = nn.Linear(esm_dim, hidden_dim)
+        self.ab_proj = nn.Linear(
+            esm_dim,
+            hidden_dim,
+        )
 
+        self.ag_proj = nn.Linear(
+            esm_dim,
+            hidden_dim,
+        )
+
+        # [Ab, Ag, |Ab-Ag|, Ab*Ag]
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
+
+            nn.Linear(
+                hidden_dim * 4,
+                hidden_dim,
+            ),
+
             nn.ReLU(),
+
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+
+            nn.Linear(
+                hidden_dim,
+                1,
+            ),
         )
 
     def get_input_embeddings(self):
+
         return self.esm.get_input_embeddings()
 
-    def encode_from_ids(self, input_ids, attention_mask):
-        outputs = self.esm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        return outputs.last_hidden_state  # [B, L, D]
+    def encode_from_ids(
+        self,
+        input_ids,
+        attention_mask,
+    ):
 
-    def encode_from_embeds(self, inputs_embeds, attention_mask):
         outputs = self.esm(
-            inputs_embeds=inputs_embeds,
+
+            input_ids=input_ids,
+
             attention_mask=attention_mask,
         )
-        return outputs.last_hidden_state  # [B, L, D]
+
+        return outputs.last_hidden_state
+
+    def encode_from_embeds(
+        self,
+        inputs_embeds,
+        attention_mask,
+    ):
+
+        outputs = self.esm(
+
+            inputs_embeds=inputs_embeds,
+
+            attention_mask=attention_mask,
+        )
+
+        return outputs.last_hidden_state
 
     def _forward_from_hidden(
         self,
@@ -242,33 +421,82 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_emb,
         antigen_attention_mask,
     ):
-        antigen_key_padding_mask = (antigen_attention_mask == 0)
-        heavy_key_padding_mask = (heavy_attention_mask == 0)
 
-        heavy_ctx, heavy_to_antigen_attn = self.ab_to_ag(
-            query=heavy_emb,
-            key_value=antigen_emb,
-            key_padding_mask=antigen_key_padding_mask,
+        antigen_key_padding_mask = (
+            antigen_attention_mask == 0
         )
 
-        antigen_ctx, antigen_to_heavy_attn = self.ag_to_ab(
-            query=antigen_emb,
-            key_value=heavy_emb,
-            key_padding_mask=heavy_key_padding_mask,
+        heavy_key_padding_mask = (
+            heavy_attention_mask == 0
         )
 
-        heavy_vec = masked_mean(self.ab_proj(heavy_ctx), heavy_attention_mask)
-        antigen_vec = masked_mean(self.ag_proj(antigen_ctx), antigen_attention_mask)
 
-        pair_feat = torch.cat([
-            heavy_vec,
-            antigen_vec,
-            torch.abs(heavy_vec - antigen_vec),
-            heavy_vec * antigen_vec,
-        ], dim=-1)
+        heavy_ctx, heavy_to_antigen_attn = (
+            self.ab_to_ag(
 
-        logits = self.classifier(pair_feat).squeeze(-1)
-        return logits, heavy_to_antigen_attn, antigen_to_heavy_attn
+                query=heavy_emb,
+
+                key_value=antigen_emb,
+
+                key_padding_mask=
+                    antigen_key_padding_mask,
+            )
+        )
+
+
+        antigen_ctx, antigen_to_heavy_attn = (
+            self.ag_to_ab(
+
+                query=antigen_emb,
+
+                key_value=heavy_emb,
+
+                key_padding_mask=
+                    heavy_key_padding_mask,
+            )
+        )
+
+   
+        heavy_vec = masked_mean(
+
+            self.ab_proj(heavy_ctx),
+
+            heavy_attention_mask,
+        )
+
+        antigen_vec = masked_mean(
+
+            self.ag_proj(antigen_ctx),
+
+            antigen_attention_mask,
+        )
+
+       
+        pair_feat = torch.cat(
+            [
+                heavy_vec,
+
+                antigen_vec,
+
+                torch.abs(
+                    heavy_vec - antigen_vec
+                ),
+
+                heavy_vec * antigen_vec,
+            ],
+            dim=-1,
+        )
+
+        logits = (
+            self.classifier(pair_feat)
+            .squeeze(-1)
+        )
+
+        return (
+            logits,
+            heavy_to_antigen_attn,
+            antigen_to_heavy_attn,
+        )
 
     def forward(
         self,
@@ -277,15 +505,31 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_input_ids,
         antigen_attention_mask,
     ):
+
+     
         with torch.no_grad():
-            heavy_emb = self.encode_from_ids(heavy_input_ids, heavy_attention_mask)
-            antigen_emb = self.encode_from_ids(antigen_input_ids, antigen_attention_mask)
+
+            heavy_emb = self.encode_from_ids(
+                heavy_input_ids,
+                heavy_attention_mask,
+            )
+
+            antigen_emb = self.encode_from_ids(
+                antigen_input_ids,
+                antigen_attention_mask,
+            )
 
         return self._forward_from_hidden(
+
             heavy_emb=heavy_emb,
-            heavy_attention_mask=heavy_attention_mask,
+
+            heavy_attention_mask=
+                heavy_attention_mask,
+
             antigen_emb=antigen_emb,
-            antigen_attention_mask=antigen_attention_mask,
+
+            antigen_attention_mask=
+                antigen_attention_mask,
         )
 
     def forward_from_embeds(
@@ -295,507 +539,1157 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_inputs_embeds,
         antigen_attention_mask,
     ):
-       
-        heavy_emb = self.encode_from_embeds(heavy_inputs_embeds, heavy_attention_mask)
-        antigen_emb = self.encode_from_embeds(antigen_inputs_embeds, antigen_attention_mask)
+
+        heavy_emb = self.encode_from_embeds(
+            heavy_inputs_embeds,
+            heavy_attention_mask,
+        )
+
+        antigen_emb = self.encode_from_embeds(
+            antigen_inputs_embeds,
+            antigen_attention_mask,
+        )
 
         return self._forward_from_hidden(
+
             heavy_emb=heavy_emb,
-            heavy_attention_mask=heavy_attention_mask,
+
+            heavy_attention_mask=
+                heavy_attention_mask,
+
             antigen_emb=antigen_emb,
-            antigen_attention_mask=antigen_attention_mask,
+
+            antigen_attention_mask=
+                antigen_attention_mask,
         )
 
 
-def compute_metrics(labels, probs, threshold=0.5):
-    labels = np.array(labels).astype(int)
-    probs = np.array(probs)
-    preds = (probs >= threshold).astype(int)
 
-    metrics = {}
-    metrics["AUC"] = safe_auc(labels, probs)
-    metrics["F1"] = f1_score(labels, preds, zero_division=0)
-    metrics["MCC"] = matthews_corrcoef(labels, preds)
-    metrics["Accuracy"] = accuracy_score(labels, preds)
+def compute_metrics(
+    labels,
+    probs,
+    threshold=0.5,
+):
 
-    return metrics
+    labels = np.asarray(
+        labels
+    ).astype(int)
+
+    probs = np.asarray(
+        probs
+    )
+
+    preds = (
+        probs >= threshold
+    ).astype(int)
+
+    return {
+
+        "AUC":
+            safe_auc(labels, probs),
+
+        "F1":
+            f1_score(
+                labels,
+                preds,
+                zero_division=0,
+            ),
+
+        "MCC":
+            matthews_corrcoef(
+                labels,
+                preds,
+            ),
+
+        "Accuracy":
+            accuracy_score(
+                labels,
+                preds,
+            ),
+    }
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+):
+
     model.train()
 
     total_loss = 0.0
+
     all_probs = []
+
     all_labels = []
 
     for batch in loader:
-        heavy_input_ids = batch["heavy_input_ids"].to(device)
-        heavy_attention_mask = batch["heavy_attention_mask"].to(device)
-        antigen_input_ids = batch["antigen_input_ids"].to(device)
-        antigen_attention_mask = batch["antigen_attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+
+        heavy_input_ids = (
+            batch["heavy_input_ids"]
+            .to(device)
+        )
+
+        heavy_attention_mask = (
+            batch["heavy_attention_mask"]
+            .to(device)
+        )
+
+        antigen_input_ids = (
+            batch["antigen_input_ids"]
+            .to(device)
+        )
+
+        antigen_attention_mask = (
+            batch["antigen_attention_mask"]
+            .to(device)
+        )
+
+        labels = (
+            batch["labels"]
+            .to(device)
+        )
 
         optimizer.zero_grad()
 
         logits, _, _ = model(
-            heavy_input_ids=heavy_input_ids,
-            heavy_attention_mask=heavy_attention_mask,
-            antigen_input_ids=antigen_input_ids,
-            antigen_attention_mask=antigen_attention_mask,
+
+            heavy_input_ids=
+                heavy_input_ids,
+
+            heavy_attention_mask=
+                heavy_attention_mask,
+
+            antigen_input_ids=
+                antigen_input_ids,
+
+            antigen_attention_mask=
+                antigen_attention_mask,
         )
 
-        loss = criterion(logits, labels)
+        loss = criterion(
+            logits,
+            labels,
+        )
+
         loss.backward()
+
         optimizer.step()
 
         total_loss += loss.item()
 
         probs = torch.sigmoid(logits)
-        all_probs.extend(probs.detach().cpu().numpy().tolist())
-        all_labels.extend(labels.detach().cpu().numpy().tolist())
 
-    metrics = compute_metrics(all_labels, all_probs)
-    return total_loss / len(loader), metrics
+        all_probs.extend(
+            probs.detach()
+            .cpu()
+            .numpy()
+            .tolist()
+        )
+
+        all_labels.extend(
+            labels.detach()
+            .cpu()
+            .numpy()
+            .tolist()
+        )
+
+    metrics = compute_metrics(
+        all_labels,
+        all_probs,
+    )
+
+    return (
+        total_loss / len(loader),
+        metrics,
+    )
+
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+):
+
     model.eval()
 
     total_loss = 0.0
+
     all_probs = []
+
     all_labels = []
 
     for batch in loader:
-        heavy_input_ids = batch["heavy_input_ids"].to(device)
-        heavy_attention_mask = batch["heavy_attention_mask"].to(device)
-        antigen_input_ids = batch["antigen_input_ids"].to(device)
-        antigen_attention_mask = batch["antigen_attention_mask"].to(device)
-        labels = batch["labels"].to(device)
 
-        logits, _, _ = model(
-            heavy_input_ids=heavy_input_ids,
-            heavy_attention_mask=heavy_attention_mask,
-            antigen_input_ids=antigen_input_ids,
-            antigen_attention_mask=antigen_attention_mask,
+        heavy_input_ids = (
+            batch["heavy_input_ids"]
+            .to(device)
         )
 
-        loss = criterion(logits, labels)
+        heavy_attention_mask = (
+            batch["heavy_attention_mask"]
+            .to(device)
+        )
+
+        antigen_input_ids = (
+            batch["antigen_input_ids"]
+            .to(device)
+        )
+
+        antigen_attention_mask = (
+            batch["antigen_attention_mask"]
+            .to(device)
+        )
+
+        labels = (
+            batch["labels"]
+            .to(device)
+        )
+
+        logits, _, _ = model(
+
+            heavy_input_ids=
+                heavy_input_ids,
+
+            heavy_attention_mask=
+                heavy_attention_mask,
+
+            antigen_input_ids=
+                antigen_input_ids,
+
+            antigen_attention_mask=
+                antigen_attention_mask,
+        )
+
+        loss = criterion(
+            logits,
+            labels,
+        )
+
         total_loss += loss.item()
 
         probs = torch.sigmoid(logits)
-        all_probs.extend(probs.detach().cpu().numpy().tolist())
-        all_labels.extend(labels.detach().cpu().numpy().tolist())
 
-    metrics = compute_metrics(all_labels, all_probs)
-    return total_loss / len(loader), metrics
-
-
-def add_spaces(seq: str) -> str:
-    return " ".join(list(seq.strip().upper()))
-
-
-def tokenize_single_sequence(tokenizer, seq: str, max_length: int):
-    text = add_spaces(seq)
-    enc = tokenizer(
-        text,
-        return_tensors="pt",
-        padding=False,
-        truncation=True,
-        max_length=max_length,
-        return_special_tokens_mask=True,
-    )
-    return enc
-
-
-def extract_residue_tokens_and_scores(
-    tokenizer,
-    input_ids: torch.Tensor,            # [L]
-    attention_mask: torch.Tensor,       # [L]
-    scores: torch.Tensor,               # [L]
-    original_seq: str,
-) -> List[Dict]:
-
-    token_ids = input_ids.detach().cpu().tolist()
-    attn = attention_mask.detach().cpu().tolist()
-    score_vals = scores.detach().cpu().tolist()
-    tokens = tokenizer.convert_ids_to_tokens(token_ids)
-
-    results = []
-    residue_idx = 0
-
-    for tok, mask_val, score in zip(tokens, attn, score_vals):
-        if mask_val == 0:
-            continue
-
-        if tok in tokenizer.all_special_tokens:
-            continue
-
-        residue_char = original_seq[residue_idx] if residue_idx < len(original_seq) else tok
-        results.append({
-            "position_1based": residue_idx + 1,
-            "residue": residue_char,
-            "token": tok,
-            "importance": float(score),
-        })
-        residue_idx += 1
-
-    return results
-
-
-def normalize_scores(scores: torch.Tensor) -> torch.Tensor:
-    if scores.numel() == 0:
-        return scores
-    smin = scores.min()
-    smax = scores.max()
-    if float(smax - smin) < 1e-12:
-        return torch.zeros_like(scores)
-    return (scores - smin) / (smax - smin)
-
-
-@torch.no_grad()
-def predict_single(
-    model,
-    tokenizer,
-    heavy_seq: str,
-    antigen_seq: str,
-    device: str,
-    max_heavy_len: int,
-    max_antigen_len: int,
-) -> Dict:
-    model.eval()
-
-    heavy_enc = tokenize_single_sequence(tokenizer, heavy_seq, max_heavy_len)
-    antigen_enc = tokenize_single_sequence(tokenizer, antigen_seq, max_antigen_len)
-
-    heavy_input_ids = heavy_enc["input_ids"].to(device)
-    heavy_attention_mask = heavy_enc["attention_mask"].to(device)
-
-    antigen_input_ids = antigen_enc["input_ids"].to(device)
-    antigen_attention_mask = antigen_enc["attention_mask"].to(device)
-
-    logits, h2a_attn, a2h_attn = model(
-        heavy_input_ids=heavy_input_ids,
-        heavy_attention_mask=heavy_attention_mask,
-        antigen_input_ids=antigen_input_ids,
-        antigen_attention_mask=antigen_attention_mask,
-    )
-
-    prob = torch.sigmoid(logits)[0].item()
-
-    return {
-        "logit": logits[0].item(),
-        "prob": prob,
-        "heavy_to_antigen_attn": h2a_attn,
-        "antigen_to_heavy_attn": a2h_attn,
-    }
-
-
-def attribute_positive_probability_to_input_embeddings(
-    model,
-    tokenizer,
-    heavy_seq: str,
-    antigen_seq: str,
-    device: str,
-    max_heavy_len: int,
-    max_antigen_len: int,
-    score_mode: str = "grad_x_input",   # "grad_norm" or "grad_x_input"
-    normalize: bool = True,
-) -> Dict:
-    """
-    score_mode:
-        - grad_norm: || d p / d e_i ||
-        - grad_x_input: sum_j | (d p / d e_ij) * e_ij |
-    """
-    model.eval()
-
-    heavy_seq = heavy_seq.strip().upper()
-    antigen_seq = antigen_seq.strip().upper()
-
-    heavy_enc = tokenize_single_sequence(tokenizer, heavy_seq, max_heavy_len)
-    antigen_enc = tokenize_single_sequence(tokenizer, antigen_seq, max_antigen_len)
-
-    heavy_input_ids = heavy_enc["input_ids"].to(device)
-    heavy_attention_mask = heavy_enc["attention_mask"].to(device)
-
-    antigen_input_ids = antigen_enc["input_ids"].to(device)
-    antigen_attention_mask = antigen_enc["attention_mask"].to(device)
-
-    embedding_layer = model.get_input_embeddings()
-
-    heavy_inputs_embeds = embedding_layer(heavy_input_ids).detach().clone()
-    antigen_inputs_embeds = embedding_layer(antigen_input_ids).detach().clone()
-
-    heavy_inputs_embeds.requires_grad_(True)
-    antigen_inputs_embeds.requires_grad_(True)
-
-    model.zero_grad(set_to_none=True)
-
-    logits, heavy_to_antigen_attn, antigen_to_heavy_attn = model.forward_from_embeds(
-        heavy_inputs_embeds=heavy_inputs_embeds,
-        heavy_attention_mask=heavy_attention_mask,
-        antigen_inputs_embeds=antigen_inputs_embeds,
-        antigen_attention_mask=antigen_attention_mask,
-    )
-
-    pos_prob = torch.sigmoid(logits)[0]
-    pos_prob.backward()
-
-    heavy_grads = heavy_inputs_embeds.grad[0]      
-    antigen_grads = antigen_inputs_embeds.grad[0]  
-    heavy_embeds_0 = heavy_inputs_embeds.detach()[0]
-    antigen_embeds_0 = antigen_inputs_embeds.detach()[0]
-
-    if score_mode == "grad_norm":
-        heavy_scores = torch.norm(heavy_grads, p=2, dim=-1)
-        antigen_scores = torch.norm(antigen_grads, p=2, dim=-1)
-    elif score_mode == "grad_x_input":
-        heavy_scores = torch.sum(torch.abs(heavy_grads * heavy_embeds_0), dim=-1)
-        antigen_scores = torch.sum(torch.abs(antigen_grads * antigen_embeds_0), dim=-1)
-    else:
-        raise ValueError("score_mode must be one of: 'grad_norm', 'grad_x_input'")
-
-    heavy_scores = heavy_scores * heavy_attention_mask[0].float()
-    antigen_scores = antigen_scores * antigen_attention_mask[0].float()
-
-    if normalize:
-        heavy_scores = normalize_scores(heavy_scores)
-        antigen_scores = normalize_scores(antigen_scores)
-
-    heavy_residue_importance = extract_residue_tokens_and_scores(
-        tokenizer=tokenizer,
-        input_ids=heavy_input_ids[0],
-        attention_mask=heavy_attention_mask[0],
-        scores=heavy_scores,
-        original_seq=heavy_seq,
-    )
-
-    antigen_residue_importance = extract_residue_tokens_and_scores(
-        tokenizer=tokenizer,
-        input_ids=antigen_input_ids[0],
-        attention_mask=antigen_attention_mask[0],
-        scores=antigen_scores,
-        original_seq=antigen_seq,
-    )
-
-    return {
-        "logit": float(logits[0].item()),
-        "positive_probability": float(pos_prob.item()),
-        "score_mode": score_mode,
-        "heavy_residue_importance": heavy_residue_importance,
-        "antigen_residue_importance": antigen_residue_importance,
-        "heavy_to_antigen_attn": heavy_to_antigen_attn.detach().cpu(),
-        "antigen_to_heavy_attn": antigen_to_heavy_attn.detach().cpu(),
-    }
-
-
-def print_top_k_residues(residue_scores: List[Dict], title: str, top_k: int = 15):
-    print(f"\n[{title}] top-{top_k}")
-    sorted_items = sorted(
-        residue_scores,
-        key=lambda x: x["importance"],
-        reverse=True
-    )[:top_k]
-
-    for item in sorted_items:
-        print(
-            f"pos={item['position_1based']:>4d} "
-            f"res={item['residue']} "
-            f"token={item['token']:<6s} "
-            f"importance={item['importance']:.6f}"
+        all_probs.extend(
+            probs.cpu()
+            .numpy()
+            .tolist()
         )
 
+        all_labels.extend(
+            labels.cpu()
+            .numpy()
+            .tolist()
+        )
 
-def save_residue_importance_csv(residue_scores: List[Dict], out_csv: str):
-    df = pd.DataFrame(residue_scores)
-    df.to_csv(out_csv, index=False)
-    print(f"Saved attribution scores to: {out_csv}")
+    metrics = compute_metrics(
+        all_labels,
+        all_probs,
+    )
+
+    return (
+        total_loss / len(loader),
+        metrics,
+    )
+
+
+
+def make_split_indices(
+    dataset,
+    seed,
+):
+
+    indices = np.arange(
+        len(dataset)
+    )
+
+    labels = np.array(
+        [
+            int(dataset[i]["label"])
+            for i in indices
+        ]
+    )
+
+
+
+    train_idx, temp_idx = train_test_split(
+
+        indices,
+
+        test_size=0.20,
+
+        random_state=seed,
+
+        stratify=labels,
+    )
+
+    temp_labels = labels[temp_idx]
+
+  
+
+    val_idx, test_idx = train_test_split(
+
+        temp_idx,
+
+        test_size=0.50,
+
+        random_state=seed,
+
+        stratify=temp_labels,
+    )
+
+    return (
+        np.asarray(train_idx),
+        np.asarray(val_idx),
+        np.asarray(test_idx),
+    )
+
+
+
+def print_split_statistics(
+    dataset,
+    indices,
+    name,
+):
+
+    labels = np.array(
+        [
+            int(dataset[int(i)]["label"])
+            for i in indices
+        ]
+    )
+
+    n = len(labels)
+
+    pos = int(labels.sum())
+
+    neg = n - pos
+
+    ratio = pos / n if n > 0 else 0
+
+    print(
+        f"{name:<12} "
+        f"N={n:<7} "
+        f"Positive={pos:<7} "
+        f"Negative={neg:<7} "
+        f"Positive ratio={ratio:.4f}"
+    )
+
+
+
+
+def build_training_criterion(
+    dataset,
+    train_idx,
+    device,
+):
+
+    train_labels = np.array(
+        [
+            int(
+                dataset[int(i)]["label"]
+            )
+            for i in train_idx
+        ]
+    )
+
+    pos = int(
+        train_labels.sum()
+    )
+
+    neg = (
+        len(train_labels) - pos
+    )
+
+    if pos > 0:
+
+        pos_weight_value = (
+            neg / pos
+        )
+
+        pos_weight = torch.tensor(
+            [pos_weight_value],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        criterion = (
+            nn.BCEWithLogitsLoss(
+                pos_weight=pos_weight
+            )
+        )
+
+    else:
+
+        pos_weight_value = 1.0
+
+        criterion = (
+            nn.BCEWithLogitsLoss()
+        )
+
+    return (
+        criterion,
+        pos_weight_value,
+    )
+
 
 
 def train_main():
-    set_seed(cfg.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+    # --------------------------------------------------------
+    # Output directories
+    # --------------------------------------------------------
+
+    split_dir = os.path.join(
+        cfg.output_dir,
+        "splits",
+    )
+
+    checkpoint_dir = os.path.join(
+        cfg.output_dir,
+        "checkpoints",
+    )
+
+    os.makedirs(
+        split_dir,
+        exist_ok=True,
+    )
+
+    os.makedirs(
+        checkpoint_dir,
+        exist_ok=True,
+    )
+
 
     dataset = PairDataset(
+
         csv_path=cfg.csv_path,
+
         heavy_col=cfg.heavy_col,
+
         antigen_col=cfg.antigen_col,
+
         label_col=cfg.label_col,
     )
 
-    val_size = max(1, int(len(dataset) * cfg.val_ratio))
-    train_size = len(dataset) - val_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(cfg.seed),
+    print(
+        f"\nDevice: {cfg.device}"
+    )
+
+    print(
+        f"Number of runs: {cfg.num_runs}"
+    )
+
+    print(
+        "Split: 80% train / "
+        "10% validation / "
+        "10% held-out test"
+    )
+
+    tokenizer = (
+        AutoTokenizer.from_pretrained(
+            cfg.model_name
+        )
     )
 
     collator = PairCollator(
+
         tokenizer=tokenizer,
-        max_heavy_len=cfg.max_heavy_len,
-        max_antigen_len=cfg.max_antigen_len,
+
+        max_heavy_len=
+            cfg.max_heavy_len,
+
+        max_antigen_len=
+            cfg.max_antigen_len,
     )
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-    )
+    all_results = []
 
-    val_loader = DataLoader(
-        val_set,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-    )
 
-    model = ESM2BidirectionalCrossAttentionClassifier(
-        model_name=cfg.model_name,
-        hidden_dim=cfg.hidden_dim,
-        num_heads=cfg.num_heads,
-        dropout=cfg.dropout,
-    ).to(cfg.device)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
+    for run_idx in range(
+        cfg.num_runs
+    ):
 
-    labels_all = [int(item["label"]) for item in dataset]
-    pos = sum(labels_all)
-    neg = len(labels_all) - pos
-
-    if pos > 0:
-        pos_weight = torch.tensor([neg / pos], dtype=torch.float32, device=cfg.device)
-        print(f"Using pos_weight = {pos_weight.item():.4f}")
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    else:
-        criterion = nn.BCEWithLogitsLoss()
-
-    best_val_auc = -1.0
-
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss, train_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion, cfg.device
+        run_number = (
+            run_idx + 1
         )
-        val_loss, val_metrics = evaluate(
-            model, val_loader, criterion, cfg.device
+
+        seed = (
+            cfg.base_seed
+            + run_idx
         )
 
         print(
-            f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.4f} "
-            f"train_AUC={train_metrics['AUC']:.4f} "
-            f"train_F1={train_metrics['F1']:.4f} "
-            f"train_MCC={train_metrics['MCC']:.4f} "
-            f"train_ACC={train_metrics['Accuracy']:.4f} | "
-            f"val_loss={val_loss:.4f} "
-            f"val_AUC={val_metrics['AUC']:.4f} "
-            f"val_F1={val_metrics['F1']:.4f} "
-            f"val_MCC={val_metrics['MCC']:.4f} "
-            f"val_ACC={val_metrics['Accuracy']:.4f}"
+            "\n"
+            + "=" * 80
         )
 
-        if val_metrics["AUC"] > best_val_auc:
-            best_val_auc = val_metrics["AUC"]
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": vars(cfg),
-                    "best_val_auc": best_val_auc,
-                },
-                cfg.save_path,
+        print(
+            f"RUN {run_number}/"
+            f"{cfg.num_runs}"
+        )
+
+        print(
+            f"Random seed: {seed}"
+        )
+
+        print(
+            "=" * 80
+        )
+
+
+        set_seed(seed)
+
+ 
+
+        (
+            train_idx,
+            val_idx,
+            test_idx,
+        ) = make_split_indices(
+            dataset,
+            seed,
+        )
+
+
+
+        assert (
+            len(
+                set(train_idx)
+                &
+                set(val_idx)
             )
-            print(f"Saved best model to {cfg.save_path}")
+            == 0
+        )
+
+        assert (
+            len(
+                set(train_idx)
+                &
+                set(test_idx)
+            )
+            == 0
+        )
+
+        assert (
+            len(
+                set(val_idx)
+                &
+                set(test_idx)
+            )
+            == 0
+        )
+
+        assert (
+            len(train_idx)
+            + len(val_idx)
+            + len(test_idx)
+            ==
+            len(dataset)
+        )
+
+  
+
+        split_path = os.path.join(
+            split_dir,
+            f"split_run{run_number}.npz",
+        )
+
+        np.savez(
+
+            split_path,
+
+            train_idx=train_idx,
+
+            val_idx=val_idx,
+
+            test_idx=test_idx,
+
+            seed=np.array([seed]),
+        )
+
+        print(
+            f"\nSaved split -> "
+            f"{split_path}"
+        )
 
 
-def load_trained_model(checkpoint_path: str, device: str):
-    ckpt = torch.load(checkpoint_path, map_location=device)
+        print(
+            "\nSplit statistics:"
+        )
 
-    model_cfg = ckpt.get("config", {})
-    model_name = model_cfg.get("model_name", cfg.model_name)
-    hidden_dim = model_cfg.get("hidden_dim", cfg.hidden_dim)
-    num_heads = model_cfg.get("num_heads", cfg.num_heads)
-    dropout = model_cfg.get("dropout", cfg.dropout)
+        print_split_statistics(
+            dataset,
+            train_idx,
+            "Train",
+        )
 
-    model = ESM2BidirectionalCrossAttentionClassifier(
-        model_name=model_name,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        dropout=dropout,
-    ).to(device)
+        print_split_statistics(
+            dataset,
+            val_idx,
+            "Validation",
+        )
 
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
-    model.eval()
+        print_split_statistics(
+            dataset,
+            test_idx,
+            "Test",
+        )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    return model, tokenizer, ckpt
+  
+
+        train_set = Subset(
+            dataset,
+            train_idx.tolist(),
+        )
+
+        val_set = Subset(
+            dataset,
+            val_idx.tolist(),
+        )
+
+        test_set = Subset(
+            dataset,
+            test_idx.tolist(),
+        )
+
+       
 
 
-def attribution_demo(
-    checkpoint_path: str,
-    heavy_seq: str,
-    antigen_seq: str,
-    score_mode: str = "grad_x_input",
-):
-    device = cfg.device
-    model, tokenizer, ckpt = load_trained_model(checkpoint_path, device)
+        train_generator = (
+            torch.Generator()
+            .manual_seed(seed)
+        )
 
-    print(f"Loaded checkpoint: {checkpoint_path}")
-    print(f"Best val AUC: {ckpt.get('best_val_auc', 'N/A')}")
+        train_loader = DataLoader(
 
-    pred = predict_single(
-        model=model,
-        tokenizer=tokenizer,
-        heavy_seq=heavy_seq,
-        antigen_seq=antigen_seq,
-        device=device,
-        max_heavy_len=cfg.max_heavy_len,
-        max_antigen_len=cfg.max_antigen_len,
+            train_set,
+
+            batch_size=
+                cfg.batch_size,
+
+            shuffle=True,
+
+            generator=
+                train_generator,
+
+            num_workers=
+                cfg.num_workers,
+
+            collate_fn=
+                collator,
+        )
+
+        val_loader = DataLoader(
+
+            val_set,
+
+            batch_size=
+                cfg.batch_size,
+
+            shuffle=False,
+
+            num_workers=
+                cfg.num_workers,
+
+            collate_fn=
+                collator,
+        )
+
+        test_loader = DataLoader(
+
+            test_set,
+
+            batch_size=
+                cfg.batch_size,
+
+            shuffle=False,
+
+            num_workers=
+                cfg.num_workers,
+
+            collate_fn=
+                collator,
+        )
+
+     
+
+        model = (
+            ESM2BidirectionalCrossAttentionClassifier(
+
+                model_name=
+                    cfg.model_name,
+
+                hidden_dim=
+                    cfg.hidden_dim,
+
+                num_heads=
+                    cfg.num_heads,
+
+                dropout=
+                    cfg.dropout,
+            )
+            .to(cfg.device)
+        )
+
+        optimizer = torch.optim.AdamW(
+
+            [
+                p
+                for p
+                in model.parameters()
+                if p.requires_grad
+            ],
+
+            lr=cfg.lr,
+
+            weight_decay=
+                cfg.weight_decay,
+        )
+
+        
+
+        (
+            criterion,
+            pos_weight,
+        ) = build_training_criterion(
+
+            dataset,
+
+            train_idx,
+
+            cfg.device,
+        )
+
+        print(
+            f"\nTraining pos_weight: "
+            f"{pos_weight:.6f}"
+        )
+
+    
+
+        best_val_auc = -np.inf
+
+        best_epoch = -1
+
+        checkpoint_path = os.path.join(
+
+            checkpoint_dir,
+
+            f"best_run{run_number}.pt",
+        )
+
+
+
+        for epoch in range(
+            1,
+            cfg.epochs + 1,
+        ):
+
+            (
+                train_loss,
+                train_metrics,
+            ) = train_one_epoch(
+
+                model,
+
+                train_loader,
+
+                optimizer,
+
+                criterion,
+
+                cfg.device,
+            )
+
+            (
+                val_loss,
+                val_metrics,
+            ) = evaluate(
+
+                model,
+
+                val_loader,
+
+                criterion,
+
+                cfg.device,
+            )
+
+            print(
+
+                f"Epoch "
+                f"{epoch:02d}/{cfg.epochs} | "
+
+                f"Train loss="
+                f"{train_loss:.4f} | "
+
+                f"Train AUC="
+                f"{train_metrics['AUC']:.4f} | "
+
+                f"Val loss="
+                f"{val_loss:.4f} | "
+
+                f"Val AUC="
+                f"{val_metrics['AUC']:.4f} | "
+
+                f"Val F1="
+                f"{val_metrics['F1']:.4f} | "
+
+                f"Val MCC="
+                f"{val_metrics['MCC']:.4f} | "
+
+                f"Val ACC="
+                f"{val_metrics['Accuracy']:.4f}"
+            )
+
+            current_val_auc = (
+                val_metrics["AUC"]
+            )
+
+            if (
+                not np.isnan(
+                    current_val_auc
+                )
+                and
+                current_val_auc
+                >
+                best_val_auc
+            ):
+
+                best_val_auc = (
+                    current_val_auc
+                )
+
+                best_epoch = epoch
+
+                torch.save(
+
+                    {
+                        "run":
+                            run_number,
+
+                        "seed":
+                            seed,
+
+                        "epoch":
+                            epoch,
+
+                        "model_state_dict":
+                            model.state_dict(),
+
+                        "optimizer_state_dict":
+                            optimizer.state_dict(),
+
+                        "config":
+                            vars(cfg),
+
+                        "best_val_auc":
+                            best_val_auc,
+
+                        "train_idx":
+                            train_idx,
+
+                        "val_idx":
+                            val_idx,
+
+                        "test_idx":
+                            test_idx,
+                    },
+
+                    checkpoint_path,
+                )
+
+                print(
+                    f"  -> Best checkpoint "
+                    f"saved "
+                    f"(Val AUC="
+                    f"{best_val_auc:.4f})"
+                )
+
+
+
+        print(
+            "\nLoading best validation checkpoint..."
+        )
+
+        checkpoint = torch.load(
+
+            checkpoint_path,
+
+            map_location=
+                cfg.device,
+        )
+
+        model.load_state_dict(
+            checkpoint[
+                "model_state_dict"
+            ]
+        )
+
+        model.eval()
+
+        (
+            test_loss,
+            test_metrics,
+        ) = evaluate(
+
+            model,
+
+            test_loader,
+
+            criterion,
+
+            cfg.device,
+        )
+
+        print(
+            "\n"
+            + "-" * 80
+        )
+
+        print(
+            f"RUN {run_number} "
+            f"HELD-OUT TEST RESULTS"
+        )
+
+        print(
+            "-" * 80
+        )
+
+        print(
+            f"Seed          : {seed}"
+        )
+
+        print(
+            f"Best epoch    : "
+            f"{best_epoch}"
+        )
+
+        print(
+            f"Best Val AUC  : "
+            f"{best_val_auc:.6f}"
+        )
+
+        print(
+            f"Test Loss     : "
+            f"{test_loss:.6f}"
+        )
+
+        print(
+            f"Test AUC      : "
+            f"{test_metrics['AUC']:.6f}"
+        )
+
+        print(
+            f"Test F1       : "
+            f"{test_metrics['F1']:.6f}"
+        )
+
+        print(
+            f"Test MCC      : "
+            f"{test_metrics['MCC']:.6f}"
+        )
+
+        print(
+            f"Test Accuracy : "
+            f"{test_metrics['Accuracy']:.6f}"
+        )
+
+
+        all_results.append(
+
+            {
+                "Run":
+                    run_number,
+
+                "Seed":
+                    seed,
+
+                "Train_N":
+                    len(train_idx),
+
+                "Validation_N":
+                    len(val_idx),
+
+                "Test_N":
+                    len(test_idx),
+
+                "Best_Epoch":
+                    best_epoch,
+
+                "Best_Validation_AUC":
+                    best_val_auc,
+
+                "Test_Loss":
+                    test_loss,
+
+                "Test_AUC":
+                    test_metrics["AUC"],
+
+                "Test_F1":
+                    test_metrics["F1"],
+
+                "Test_MCC":
+                    test_metrics["MCC"],
+
+                "Test_Accuracy":
+                    test_metrics["Accuracy"],
+            }
+        )
+
+
+
+        del model
+
+        if torch.cuda.is_available():
+
+            torch.cuda.empty_cache()
+
+
+
+    results_df = pd.DataFrame(
+        all_results
     )
-    print(f"\nPrediction:")
-    print(f"logit = {pred['logit']:.6f}")
-    print(f"positive probability = {pred['prob']:.6f}")
 
-    attr = attribute_positive_probability_to_input_embeddings(
-        model=model,
-        tokenizer=tokenizer,
-        heavy_seq=heavy_seq,
-        antigen_seq=antigen_seq,
-        device=device,
-        max_heavy_len=cfg.max_heavy_len,
-        max_antigen_len=cfg.max_antigen_len,
-        score_mode=score_mode,
-        normalize=True,
+    results_path = os.path.join(
+        cfg.output_dir,
+        "five_run_results.csv",
     )
 
-    print(f"\nAttribution mode: {attr['score_mode']}")
-    print(f"logit = {attr['logit']:.6f}")
-    print(f"positive_probability = {attr['positive_probability']:.6f}")
-
-    print_top_k_residues(attr["heavy_residue_importance"], "Heavy chain", top_k=15)
-    print_top_k_residues(attr["antigen_residue_importance"], "Antigen", top_k=15)
-
-    save_residue_importance_csv(
-        attr["heavy_residue_importance"],
-        "heavy_residue_importance.csv"
-    )
-    save_residue_importance_csv(
-        attr["antigen_residue_importance"],
-        "antigen_residue_importance.csv"
+    results_df.to_csv(
+        results_path,
+        index=False,
     )
 
-    return attr
+    print(
+        "\n"
+        + "=" * 80
+    )
+
+    print(
+        "FIVE-RUN HELD-OUT TEST SUMMARY"
+    )
+
+    print(
+        "=" * 80
+    )
+
+    print(
+        results_df.to_string(
+            index=False
+        )
+    )
+
+
+
+    metric_columns = [
+
+        "Test_AUC",
+
+        "Test_F1",
+
+        "Test_MCC",
+
+        "Test_Accuracy",
+    ]
+
+    summary_rows = []
+
+    print(
+        "\nMean ± SD across "
+        "five independent runs:"
+    )
+
+    for metric in metric_columns:
+
+        values = (
+            results_df[metric]
+            .astype(float)
+            .to_numpy()
+        )
+
+        mean_value = (
+            np.nanmean(values)
+        )
+
+        sd_value = (
+            np.nanstd(
+                values,
+                ddof=1,
+            )
+        )
+
+        summary_rows.append(
+
+            {
+                "Metric":
+                    metric,
+
+                "Mean":
+                    mean_value,
+
+                "SD":
+                    sd_value,
+            }
+        )
+
+        print(
+            f"{metric:<15}: "
+            f"{mean_value:.4f} "
+            f"± "
+            f"{sd_value:.4f}"
+        )
+
+    summary_df = pd.DataFrame(
+        summary_rows
+    )
+
+    summary_path = os.path.join(
+        cfg.output_dir,
+        "five_run_summary.csv",
+    )
+
+    summary_df.to_csv(
+        summary_path,
+        index=False,
+    )
+
+    print(
+        f"\nPer-run results saved to:\n"
+        f"{results_path}"
+    )
+
+    print(
+        f"\nSummary saved to:\n"
+        f"{summary_path}"
+    )
+
+    print(
+        f"\nSplits saved to:\n"
+        f"{split_dir}"
+    )
+
+    print(
+        f"\nCheckpoints saved to:\n"
+        f"{checkpoint_dir}"
+    )
+
+    return (
+        results_df,
+        summary_df,
+    )
+
 
 
 if __name__ == "__main__":
- 
-    demo_heavy = "EVQLVESGGGLVQPGGSLRLSCAASGFTVSDNYMSWVRQAPGKGLQWVSVIYSGGNTYYADFVKGRFNITRDDSKNMLYLQMNSLRREDTAVYYCVRDRRIVGYYFGLDVWGQGTTVTVFS"
-    demo_antigen = "RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNF"
-    
+
+    train_main()
