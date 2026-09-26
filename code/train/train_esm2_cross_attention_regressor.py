@@ -6,12 +6,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.model_selection import train_test_split
 
 from scipy.stats import pearsonr, spearmanr
 from transformers import AutoTokenizer, AutoModel
 
-# Config
+
 @dataclass
 class Config:
     csv_path: str = "biomap.csv"
@@ -33,17 +34,19 @@ class Config:
     hidden_dim: int = 256
     dropout: float = 0.1
 
+    train_ratio: float = 0.8
     val_ratio: float = 0.1
-    seed: int = 42
+    test_ratio: float = 0.1
+    num_runs: int = 5
+    base_seed: int = 42
     num_workers: int = 0
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_path: str = "best_esm2_cross_attention_regression.pt"
+    output_dir: str = "affinity_five_run_results"
 
 
 cfg = Config()
 
-# Utils
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -75,7 +78,7 @@ def safe_spearman(y_true, y_pred):
         return float("nan")
     return spearmanr(y_true, y_pred)[0]
 
-# Dataset
+
 
 class PairRegressionDataset(Dataset):
     def __init__(self, csv_path, heavy_col, antigen_col, label_col):
@@ -121,7 +124,7 @@ class PairRegressionDataset(Dataset):
             "label": float(label),
         }
 
-# Collator
+
 
 class PairCollator:
     def __init__(self, tokenizer, max_heavy_len, max_antigen_len):
@@ -162,7 +165,7 @@ class PairCollator:
             "labels": labels,
         }
 
-# Cross Attention Block
+
 
 class CrossAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads=8, dropout=0.1):
@@ -187,7 +190,7 @@ class CrossAttentionBlock(nn.Module):
         out = self.norm(query + self.dropout(out))
         return out, attn_weights
 
-# Model
+
 
 class ESM2BidirectionalCrossAttentionRegressor(nn.Module):
     def __init__(self, model_name, hidden_dim=256, num_heads=8, dropout=0.1):
@@ -268,8 +271,6 @@ class ESM2BidirectionalCrossAttentionRegressor(nn.Module):
         preds = self.regressor(pair_feat).squeeze(-1)
         return preds, heavy_to_antigen_attn, antigen_to_heavy_attn
 
-# Metrics
-
 def compute_regression_metrics(labels, preds):
     labels = np.asarray(labels, dtype=float)
     preds = np.asarray(preds, dtype=float)
@@ -279,10 +280,12 @@ def compute_regression_metrics(labels, preds):
         "Spearman": safe_spearman(labels, preds),
     }
 
-# Train / Eval
+
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
+    # Keep the frozen ESM-2 encoder deterministic during training.
+    model.esm.eval()
 
     total_loss = 0.0
     all_preds = []
@@ -346,98 +349,147 @@ def evaluate(model, loader, criterion, device):
     metrics = compute_regression_metrics(all_labels, all_preds)
     return total_loss / len(loader), metrics
 
-# Main
+
+
+def make_split_indices(n_samples, seed):
+    if not np.isclose(cfg.train_ratio + cfg.val_ratio + cfg.test_ratio, 1.0):
+        raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.0")
+
+    indices = np.arange(n_samples)
+    train_val_idx, test_idx = train_test_split(
+        indices, test_size=cfg.test_ratio, random_state=seed, shuffle=True
+    )
+    val_fraction = cfg.val_ratio / (cfg.train_ratio + cfg.val_ratio)
+    train_idx, val_idx = train_test_split(
+        train_val_idx, test_size=val_fraction, random_state=seed, shuffle=True
+    )
+    return np.asarray(train_idx), np.asarray(val_idx), np.asarray(test_idx)
+
+def make_loader(dataset, indices, collator, shuffle, seed):
+    g = torch.Generator().manual_seed(seed)
+    return DataLoader(
+        Subset(dataset, indices.tolist()),
+        batch_size=cfg.batch_size, shuffle=shuffle,
+        num_workers=cfg.num_workers, collate_fn=collator,
+        generator=g if shuffle else None,
+    )
 
 def main():
-    set_seed(cfg.seed)
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    split_dir = os.path.join(cfg.output_dir, "splits")
+    ckpt_dir = os.path.join(cfg.output_dir, "checkpoints")
+    os.makedirs(split_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-
     dataset = PairRegressionDataset(
-        csv_path=cfg.csv_path,
-        heavy_col=cfg.heavy_col,
-        antigen_col=cfg.antigen_col,
-        label_col=cfg.label_col,
+        csv_path=cfg.csv_path, heavy_col=cfg.heavy_col,
+        antigen_col=cfg.antigen_col, label_col=cfg.label_col,
     )
-
-    val_size = max(1, int(len(dataset) * cfg.val_ratio))
-    train_size = len(dataset) - val_size
-    train_set, val_set = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(cfg.seed),
-    )
-
-    collator = PairCollator(
-        tokenizer=tokenizer,
-        max_heavy_len=cfg.max_heavy_len,
-        max_antigen_len=cfg.max_antigen_len,
-    )
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-    )
-
-    val_loader = DataLoader(
-        val_set,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collator,
-    )
-
-    model = ESM2BidirectionalCrossAttentionRegressor(
-        model_name=cfg.model_name,
-        hidden_dim=cfg.hidden_dim,
-        num_heads=cfg.num_heads,
-        dropout=cfg.dropout,
-    ).to(cfg.device)
-
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-
+    collator = PairCollator(tokenizer, cfg.max_heavy_len, cfg.max_antigen_len)
     criterion = nn.MSELoss()
+    rows = []
 
-    best_val_pearson = -float("inf")
+    for run in range(1, cfg.num_runs + 1):
+        seed = cfg.base_seed + run - 1
+        set_seed(seed)
+        train_idx, val_idx, test_idx = make_split_indices(len(dataset), seed)
 
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss, train_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion, cfg.device
+      
+        assert not (set(train_idx) & set(val_idx))
+        assert not (set(train_idx) & set(test_idx))
+        assert not (set(val_idx) & set(test_idx))
+        assert len(set(train_idx) | set(val_idx) | set(test_idx)) == len(dataset)
+
+        np.savez(
+            os.path.join(split_dir, f"split_run{run}.npz"),
+            train_idx=train_idx, val_idx=val_idx, test_idx=test_idx, seed=seed,
         )
-        val_loss, val_metrics = evaluate(
-            model, val_loader, criterion, cfg.device
+        print(f"\
+Run {run}/5 seed={seed}: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+        train_loader = make_loader(dataset, train_idx, collator, True, seed)
+        val_loader = make_loader(dataset, val_idx, collator, False, seed)
+        test_loader = make_loader(dataset, test_idx, collator, False, seed)
+
+        set_seed(seed)
+        model = ESM2BidirectionalCrossAttentionRegressor(
+            model_name=cfg.model_name, hidden_dim=cfg.hidden_dim,
+            num_heads=cfg.num_heads, dropout=cfg.dropout,
+        ).to(cfg.device)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=cfg.lr, weight_decay=cfg.weight_decay,
         )
 
-        print(
-            f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.4f} "
-            f"train_Pearson={train_metrics['Pearson']:.4f} "
-            f"train_Spearman={train_metrics['Spearman']:.4f} | "
-            f"val_loss={val_loss:.4f} "
-            f"val_Pearson={val_metrics['Pearson']:.4f} "
-            f"val_Spearman={val_metrics['Spearman']:.4f}"
-        )
+        best_val_pearson = -float("inf")
+        best_epoch = -1
+        ckpt = os.path.join(ckpt_dir, f"best_run{run}_seed{seed}.pt")
 
-        val_pearson = val_metrics["Pearson"]
-        if not np.isnan(val_pearson) and val_pearson > best_val_pearson:
-            best_val_pearson = val_pearson
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": vars(cfg),
-                    "best_val_pearson": best_val_pearson,
-                },
-                cfg.save_path,
+        for epoch in range(1, cfg.epochs + 1):
+            train_loss, train_metrics = train_one_epoch(
+                model, train_loader, optimizer, criterion, cfg.device
             )
-            print(f"Saved best model to {cfg.save_path}")
+            val_loss, val_metrics = evaluate(model, val_loader, criterion, cfg.device)
+            print(
+                f"Epoch {epoch:02d} | train_loss={train_loss:.4f} "
+                f"train_Pearson={train_metrics['Pearson']:.4f} "
+                f"train_Spearman={train_metrics['Spearman']:.4f} | "
+                f"val_loss={val_loss:.4f} val_Pearson={val_metrics['Pearson']:.4f} "
+                f"val_Spearman={val_metrics['Spearman']:.4f}"
+            )
+            vp = val_metrics["Pearson"]
+            if not np.isnan(vp) and vp > best_val_pearson:
+                best_val_pearson = float(vp)
+                best_epoch = epoch
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "run": run, "seed": seed, "best_epoch": epoch,
+                    "best_val_pearson": best_val_pearson,
+                }, ckpt)
 
+        if best_epoch < 0:
+            raise RuntimeError(f"Run {run}: no valid validation Pearson obtained")
+
+       
+        state = torch.load(ckpt, map_location=cfg.device)
+        model.load_state_dict(state["model_state_dict"])
+        test_loss, test_metrics = evaluate(model, test_loader, criterion, cfg.device)
+        print(
+            f"TEST run={run}: Pearson={test_metrics['Pearson']:.4f}, "
+            f"Spearman={test_metrics['Spearman']:.4f}, MSE={test_loss:.4f}"
+        )
+        rows.append({
+            "run": run, "seed": seed, "best_epoch": best_epoch,
+            "best_val_Pearson": best_val_pearson, "test_MSE": test_loss,
+            "test_Pearson": test_metrics["Pearson"],
+            "test_Spearman": test_metrics["Spearman"],
+        })
+
+        del model, optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results = pd.DataFrame(rows)
+    results.to_csv(os.path.join(cfg.output_dir, "five_run_results.csv"), index=False)
+
+    summary = []
+    for metric in ["test_MSE", "test_Pearson", "test_Spearman"]:
+        vals = results[metric].astype(float)
+        summary.append({
+            "metric": metric, "n_runs": len(vals),
+            "mean": vals.mean(), "sd": vals.std(ddof=1),
+            "mean_plus_minus_sd": f"{vals.mean():.4f} ± {vals.std(ddof=1):.4f}",
+        })
+    summary = pd.DataFrame(summary)
+    summary.to_csv(os.path.join(cfg.output_dir, "five_run_summary.csv"), index=False)
+
+    print("\
+Five-run held-out test results:")
+    print(results.to_string(index=False))
+    print("\
+Mean ± s.d. (sample SD, ddof=1):")
+    print(summary[["metric", "mean_plus_minus_sd"]].to_string(index=False))
 
 if __name__ == "__main__":
     main()
