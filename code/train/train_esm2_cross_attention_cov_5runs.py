@@ -18,9 +18,6 @@ from sklearn.metrics import (
 from transformers import AutoTokenizer, AutoModel
 
 
-# =========================================================
-# Config
-# =========================================================
 @dataclass
 class Config:
     split_dir: str = "splits"
@@ -54,9 +51,7 @@ class Config:
 cfg = Config()
 
 
-# =========================================================
-# Utils
-# =========================================================
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -72,9 +67,6 @@ def masked_mean(x, mask):
     return x.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
 
-# =========================================================
-# Dataset
-# =========================================================
 class PairDataset(Dataset):
     def __init__(self, csv_path, heavy_col, antigen_col, label_col):
         df = pd.read_csv(csv_path)
@@ -121,10 +113,7 @@ class PairDataset(Dataset):
         }
 
 
-# =========================================================
-# Collator
-# ESM tokenization expects amino acids separated by spaces
-# =========================================================
+
 class PairCollator:
     def __init__(self, tokenizer, max_heavy_len, max_antigen_len):
         self.tokenizer = tokenizer
@@ -165,9 +154,7 @@ class PairCollator:
         }
 
 
-# =========================================================
-# Cross Attention Block
-# =========================================================
+
 class CrossAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads=8, dropout=0.1):
         super().__init__()
@@ -192,9 +179,6 @@ class CrossAttentionBlock(nn.Module):
         return out, attn_weights
 
 
-# =========================================================
-# Model
-# =========================================================
 class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
     def __init__(self, model_name, hidden_dim=256, num_heads=8, dropout=0.1):
         super().__init__()
@@ -202,7 +186,7 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.esm = AutoModel.from_pretrained(model_name)
 
-        # Freeze ESM2
+  
         for p in self.esm.parameters():
             p.requires_grad = False
 
@@ -250,14 +234,13 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         antigen_key_padding_mask = (antigen_attention_mask == 0)
         heavy_key_padding_mask = (heavy_attention_mask == 0)
 
-        # Heavy attends to antigen
+ 
         heavy_ctx, heavy_to_antigen_attn = self.ab_to_ag(
             query=heavy_emb,
             key_value=antigen_emb,
             key_padding_mask=antigen_key_padding_mask,
         )
 
-        # Antigen attends to heavy
         antigen_ctx, antigen_to_heavy_attn = self.ag_to_ab(
             query=antigen_emb,
             key_value=heavy_emb,
@@ -278,9 +261,7 @@ class ESM2BidirectionalCrossAttentionClassifier(nn.Module):
         return logits, heavy_to_antigen_attn, antigen_to_heavy_attn
 
 
-# =========================================================
-# Metrics
-# =========================================================
+
 def compute_metrics(labels, probs, threshold=0.5):
     labels = np.array(labels).astype(int)
     probs = np.array(probs)
@@ -288,7 +269,7 @@ def compute_metrics(labels, probs, threshold=0.5):
 
     metrics = {}
 
-    # Some folds may theoretically have one class only
+
     try:
         metrics["AUC"] = roc_auc_score(labels, probs)
     except ValueError:
@@ -301,12 +282,10 @@ def compute_metrics(labels, probs, threshold=0.5):
     return metrics
 
 
-# =========================================================
-# Train / Eval
-# =========================================================
+
     model.train()
 
-    # Frozen ESM-2 encoder: disable encoder dropout during training.
+   
     model.esm.eval()
 
     total_loss = 0.0
@@ -376,10 +355,6 @@ def evaluate(model, loader, criterion, device):
     return total_loss / len(loader), metrics
 
 
-# =========================================================
-# Main
-# Five predefined 80/10/10 splits
-# =========================================================
 
 def main():
 
@@ -428,10 +403,7 @@ def main():
         print(f"Val:   {val_csv}")
         print(f"Test:  {test_csv}")
 
-        # -------------------------------------------------
-        # Load the predefined partitions.
-        # NO random split is performed here.
-        # -------------------------------------------------
+
         train_set = PairDataset(
             train_csv,
             cfg.heavy_col,
@@ -497,9 +469,7 @@ def main():
             collate_fn=collator,
         )
 
-        # -------------------------------------------------
-        # Fresh model for every run
-        # -------------------------------------------------
+     
         model = ESM2BidirectionalCrossAttentionClassifier(
             model_name=cfg.model_name,
             hidden_dim=cfg.hidden_dim,
@@ -516,9 +486,7 @@ def main():
             weight_decay=cfg.weight_decay,
         )
 
-        # -------------------------------------------------
-        # Calculate pos_weight from TRAINING DATA ONLY.
-        # -------------------------------------------------
+       
         train_labels = [
             int(train_set[i]["label"])
             for i in range(len(train_set))
@@ -557,9 +525,7 @@ def main():
         best_val_auc = -np.inf
         best_epoch = -1
 
-        # -------------------------------------------------
-        # Train
-        # -------------------------------------------------
+        
         for epoch in range(1, cfg.epochs + 1):
 
             train_loss, train_metrics = train_one_epoch(
@@ -591,7 +557,7 @@ def main():
                 f"val_ACC={val_metrics['Accuracy']:.4f}"
             )
 
-            # Model selection is based ONLY on validation AUC.
+
             if (
                 not np.isnan(val_metrics["AUC"])
                 and val_metrics["AUC"] > best_val_auc
@@ -633,9 +599,7 @@ def main():
                 f"No valid checkpoint for run {run}"
             )
 
-        # -------------------------------------------------
-        # Restore best validation checkpoint
-        # -------------------------------------------------
+       
         try:
             ckpt = torch.load(
                 checkpoint_path,
@@ -654,9 +618,7 @@ def main():
 
         model.eval()
 
-        # -------------------------------------------------
-        # Held-out test evaluation
-        # -------------------------------------------------
+        
         test_loss, test_metrics = evaluate(
             model,
             test_loader,
@@ -690,7 +652,6 @@ def main():
             }
         )
 
-        # Save after every completed run.
         pd.DataFrame(all_results).to_csv(
             os.path.join(
                 cfg.output_dir,
@@ -705,9 +666,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # =====================================================
-    # Five-run mean +/- sample SD
-    # =====================================================
+
     results_df = pd.DataFrame(all_results)
 
     print("\\n" + "=" * 80)
@@ -744,7 +703,7 @@ def main():
 
         mean = values.mean()
 
-        # Sample standard deviation, n-1 denominator.
+
         sd = values.std(ddof=1)
 
         summary_rows.append(
