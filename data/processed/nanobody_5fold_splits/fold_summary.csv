@@ -1,0 +1,6 @@
+fold,train_samples,train_positive,train_negative,train_unique_VHH,validation_samples,validation_positive,validation_negative,validation_unique_VHH,VHH_overlap
+1,449,393,56,253,113,99,14,64,0
+2,450,394,56,253,112,98,14,64,0
+3,448,393,55,253,114,99,15,64,0
+4,450,394,56,254,112,98,14,63,0
+5,451,394,57,255,111,98,13,62,0
