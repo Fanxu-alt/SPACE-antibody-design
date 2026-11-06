@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import platform
 import json
 import math
 import os
@@ -26,19 +28,18 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Reproducibility is prioritized over maximum speed.
+ 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
 
 AMINO_ACIDS = list("ACDEFGHIKLMNPQRSTVWY")
-SPECIAL_TOKENS = ["X", "<PAD>"]
+SPECIAL_TOKENS = ["<PAD>"]
 
 ITOS = AMINO_ACIDS + SPECIAL_TOKENS
 STOI = {token: index for index, token in enumerate(ITOS)}
 
-UNK_IDX = STOI["X"]
 PAD_IDX = STOI["<PAD>"]
 VOCAB_SIZE = len(ITOS)
 CANONICAL_AA = set(AMINO_ACIDS)
@@ -82,9 +83,8 @@ class Config:
 
 
 def clean_sequence(raw: str) -> str:
-    """Keep only canonical amino-acid characters."""
-    sequence = str(raw).strip().upper()
-    return "".join(character for character in sequence if character in CANONICAL_AA)
+    """Normalize case/whitespace only; reject rather than mutate invalid residues."""
+    return str(raw).strip().upper()
 
 
 def load_unique_sequences(
@@ -103,7 +103,7 @@ def load_unique_sequences(
     length_filtered_count = 0
     accepted: list[str] = []
 
-    with input_path.open("r", encoding="utf-8", errors="ignore") as handle:
+    with input_path.open("r", encoding="utf-8", errors="strict") as handle:
         for line in handle:
             raw_count += 1
             original = line.strip()
@@ -112,8 +112,9 @@ def load_unique_sequences(
                 continue
 
             cleaned = clean_sequence(original)
-            if cleaned != original.upper():
+            if any(aa not in CANONICAL_AA for aa in cleaned):
                 invalid_or_cleaned_count += 1
+                continue
 
             if not (min_seq_len <= len(cleaned) <= max_seq_len):
                 length_filtered_count += 1
@@ -131,7 +132,7 @@ def load_unique_sequences(
     summary = {
         "raw_lines": raw_count,
         "empty_lines": empty_count,
-        "lines_with_noncanonical_characters_removed": invalid_or_cleaned_count,
+        "lines_rejected_for_noncanonical_characters": invalid_or_cleaned_count,
         "length_filtered_lines": length_filtered_count,
         "accepted_before_deduplication": len(accepted),
         "unique_sequences": len(unique_sequences),
@@ -155,7 +156,7 @@ class CDRH3TextDataset(Dataset):
         clipped = sequence[: self.max_seq_len]
 
         token_ids = [
-            STOI.get(amino_acid, UNK_IDX)
+            STOI[amino_acid]
             for amino_acid in clipped
         ]
 
@@ -347,6 +348,7 @@ class CDRH3CNNVAE(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
+        sample_latent: bool = True,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -355,7 +357,7 @@ class CDRH3CNNVAE(nn.Module):
         torch.Tensor,
     ]:
         mu, logvar = self.encoder(tokens)
-        latent = self.reparameterize(mu, logvar)
+        latent = self.reparameterize(mu, logvar) if sample_latent else mu
         reconstruction_logits = self.decoder(latent)
         length_logits = self.length_head(latent)
 
@@ -405,7 +407,7 @@ def compute_loss(
     )
     kl_loss = kl_per_sequence.mean()
 
-    # Length classes are 0..max_seq_len-1 for lengths 1..max_seq_len.
+ 
     length_targets = true_lengths - 1
     length_loss = F.cross_entropy(
         length_logits,
@@ -513,7 +515,7 @@ def run_epoch(
                 logvar,
                 length_logits,
                 _,
-            ) = model(tokens)
+            ) = model(tokens, sample_latent=is_training)
 
             total_loss, components = compute_loss(
                 logits=logits,
@@ -537,8 +539,9 @@ def run_epoch(
 
                 optimizer.step()
 
+          
             for key in loss_sums:
-                loss_sums[key] += components[key].item()
+                loss_sums[key] += components[key].item() * tokens.size(0)
 
             (
                 batch_correct,
@@ -563,7 +566,7 @@ def run_epoch(
         raise RuntimeError("The DataLoader produced zero batches.")
 
     metrics = {
-        f"{key}_loss": value / number_of_batches
+        f"{key}_loss": value / total_sequences
         for key, value in loss_sums.items()
     }
     metrics["token_accuracy"] = (
@@ -616,7 +619,7 @@ def write_reconstruction_examples(
         tokens, true_length = dataset[index]
         batch_tokens = tokens.unsqueeze(0).to(device)
 
-        logits, _, _, length_logits, _ = model(batch_tokens)
+        logits, _, _, length_logits, _ = model(batch_tokens, sample_latent=False)
 
         predicted_tokens = (
             logits.argmax(dim=-1)
@@ -677,6 +680,10 @@ def save_checkpoint(
             "itos": ITOS,
             "train_metrics": train_metrics,
             "validation_metrics": validation_metrics,
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": (lambda state: (state[0], state[1].tolist(), state[2], state[3], state[4]))(np.random.get_state()),
+            "python_rng_state": random.getstate(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
         output_path,
     )
@@ -770,7 +777,9 @@ def main() -> None:
         raise ValueError("max_seq_len must be >= min_seq_len.")
     if not 0 < config.val_fraction < 1:
         raise ValueError("val_fraction must lie strictly between 0 and 1.")
-    if config.kernel_size % 2 == 0:
+    if config.batch_size < 1 or config.epochs < 1 or config.num_workers < 0:
+        raise ValueError("batch_size and epochs must be positive; num_workers nonnegative.")
+    if config.kernel_size < 1 or config.kernel_size % 2 == 0:
         raise ValueError("kernel_size should be odd to preserve sequence length.")
 
     set_seed(config.seed)
@@ -795,6 +804,17 @@ def main() -> None:
         min_seq_len=config.min_seq_len,
         max_seq_len=config.max_seq_len,
     )
+
+    # Record a cryptographic digest to identify the exact pretraining corpus.
+    digest = hashlib.sha256()
+    with Path(config.input_txt).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    dataset_summary["input_sha256"] = digest.hexdigest()
+    dataset_summary["python_version"] = platform.python_version()
+    dataset_summary["torch_version"] = torch.__version__
+    dataset_summary["numpy_version"] = np.__version__
+    dataset_summary["pandas_version"] = pd.__version__
 
     with (
         output_directory / "dataset_summary.json"
@@ -830,6 +850,13 @@ def main() -> None:
             validation_size,
         ],
         generator=split_generator,
+    )
+
+
+    np.savez_compressed(
+        output_directory / "split_indices.npz",
+        train_indices=np.asarray(training_dataset.indices, dtype=np.int64),
+        val_indices=np.asarray(validation_dataset.indices, dtype=np.int64),
     )
 
     use_cuda = (
@@ -914,11 +941,12 @@ def main() -> None:
             gradient_clip_norm=config.gradient_clip_norm,
         )
 
+       
         validation_metrics = run_epoch(
             model=model,
             loader=validation_loader,
             device=device,
-            beta=beta,
+            beta=config.beta_kl,
             length_loss_weight=config.length_loss_weight,
             optimizer=None,
             gradient_clip_norm=0.0,
@@ -927,6 +955,7 @@ def main() -> None:
         history_row: dict[str, float | int] = {
             "epoch": epoch,
             "beta": beta,
+            "val_beta": config.beta_kl,
         }
 
         history_row.update(
@@ -1041,4 +1070,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
