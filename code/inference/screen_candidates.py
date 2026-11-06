@@ -1,985 +1,369 @@
+from __future__ import annotations
+
 import argparse
+import hashlib
+import json
+import logging
+import math
+import platform
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
+LOG = logging.getLogger("space.developability")
+AA = frozenset("ACDEFGHIKLMNPQRSTVWY")
+KD = dict(zip("IVLFCMAGTSWYPHEQDNKR", [4.5, 4.2, 3.8, 2.8, 2.5, 1.9, 1.8, -0.4, -0.7, -0.8, -0.9, -1.3, -1.6, -3.2, -3.5, -3.5, -3.5, -3.5, -3.9, -4.5]))
+PKA = {"Nterm": 8.0, "Cterm": 3.1, "C": 8.5, "D": 3.9, "E": 4.1, "H": 6.0, "K": 10.5, "R": 12.5, "Y": 10.1}
+POS, NEG = frozenset("KRH"), frozenset("DE")
+HYDROPHOBIC, AROMATIC = frozenset("AILMFWVYC"), frozenset("FWY")
 
-AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
-
-KD_SCALE = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5,
-    "M": 1.9, "A": 1.8, "G": -0.4, "T": -0.7, "S": -0.8,
-    "W": -0.9, "Y": -1.3, "P": -1.6, "H": -3.2,
-    "E": -3.5, "Q": -3.5, "D": -3.5, "N": -3.5,
-    "K": -3.9, "R": -4.5,
-}
-
-PKA = {
-    "Cterm": 3.1,
-    "Nterm": 8.0,
-    "C": 8.5,
-    "D": 3.9,
-    "E": 4.1,
-    "H": 6.0,
-    "K": 10.5,
-    "R": 12.5,
-    "Y": 10.1,
-}
-
-POSITIVE = set("KRH")
-NEGATIVE = set("DE")
-HYDROPHOBIC = set("AILMFWVYC")
-AROMATIC = set("FWY")
-
-ABS_THRESHOLDS = {
-    "cdr3_len_min": 8,
-    "cdr3_len_max": 20,
-    "extra_cys_cdr3_max": 0,
-    "n_glyco_motif_cdr3_max": 0,
-    "deamidation_motif_cdr3_max": 1,
-    "isomerization_motif_cdr3_max": 1,
-    "max_hydrophobic_run_cdr3_max": 5,
-    "gravy_cdr3_max": 0.8,
-    "net_charge_cdr3_abs_max": 4,
-    "oxidation_m_count_cdr3_max": 1,
+DEFAULT_CONFIG: dict[str, Any] = {
+    "pH": 7.4,
+    "thresholds": {
+        "cdr3_len_min": 8, "cdr3_len_max": 20,
+        "cdr3_cysteines_max": 0, "cdr3_n_glyco_motifs_max": 0,
+        "cdr3_deamidation_motifs_max": 1, "cdr3_isomerization_motifs_max": 1,
+        "cdr3_hydrophobic_run_max": 5, "cdr3_gravy_max": 0.8,
+        "cdr3_abs_charge_max": 4.0, "cdr3_methionines_max": 1,
+    },
+    "motif_weights": {
+        "cdr3_n_glyco_motifs": 4.0, "cdr3_deamidation_motifs": 2.0,
+        "cdr3_isomerization_motifs": 2.0, "cdr3_cysteines": 4.0,
+        "cdr3_methionines": 0.75,
+    },
+    "upper_tail_metrics": ["cdr3_gravy", "cdr3_hydrophobic_run", "cdr3_max_window_gravy_5", "cdr3_max_window_abs_charge_5"],
+    "two_sided_metrics": ["cdr3_len"],
+    "charge_tolerance": 2.5,
+    "charge_penalty_weight": 0.75,
+    "risk_percentile_max": 50.0,
+    "heavy_novelty_min": 0.10,
+    "cdr3_novelty_min": 0.20,
+    "require_cdr3_in_heavy": True,
 }
 
 
-def clean_seq(seq: str) -> str:
-    seq = str(seq or "").strip().upper()
-    return "".join(ch for ch in seq if ch in AMINO_ACIDS)
+def validate_config(cfg: dict[str, Any]) -> None:
+    """Avoid silently changing scientific definitions through partial configs."""
+    if set(cfg) != set(DEFAULT_CONFIG):
+        raise ValueError("Config keys must match defaults exactly")
+    for key in ("thresholds", "motif_weights"):
+        if set(cfg[key]) != set(DEFAULT_CONFIG[key]):
+            raise ValueError(f"Config {key} keys must match defaults exactly")
+    for k, v in cfg["thresholds"].items():
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"Invalid threshold {k}={v}")
+    if cfg["thresholds"]["cdr3_len_min"] > cfg["thresholds"]["cdr3_len_max"]:
+        raise ValueError("Minimum CDR3 length exceeds maximum")
+    for key in ("motif_weights",):
+        if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in cfg[key].values()):
+            raise ValueError(f"All {key} must be nonnegative finite numbers")
+    for key in ("pH", "charge_tolerance", "charge_penalty_weight", "risk_percentile_max", "heavy_novelty_min", "cdr3_novelty_min"):
+        v = cfg[key]
+        if not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"Invalid {key}={v}")
+    if not 0 <= cfg["pH"] <= 14 or not 0 <= cfg["risk_percentile_max"] <= 100:
+        raise ValueError("pH must be 0..14, percentile 0..100")
+    if any(cfg[k] < 0 for k in ("charge_tolerance", "charge_penalty_weight", "heavy_novelty_min", "cdr3_novelty_min")):
+        raise ValueError("Tolerance/weights/distances cannot be negative")
+    if any(cfg[k] > 1 for k in ("heavy_novelty_min", "cdr3_novelty_min")):
+        raise ValueError("Novelty distances must be <= 1")
+    if not isinstance(cfg["require_cdr3_in_heavy"], bool):
+        raise ValueError("require_cdr3_in_heavy must be boolean")
+    metric_columns = {"cdr3_gravy", "cdr3_hydrophobic_run", "cdr3_max_window_gravy_5", "cdr3_max_window_abs_charge_5", "cdr3_len"}
+    if set(cfg["upper_tail_metrics"] + cfg["two_sided_metrics"]) != metric_columns or len(cfg["upper_tail_metrics"] + cfg["two_sided_metrics"]) != len(metric_columns):
+        raise ValueError("Tail metric lists must partition the five prespecified metrics")
 
 
-def clean_target(x: str) -> str:
-    return str(x or "").strip()
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def count_motif_regex(seq: str, pattern: str) -> int:
-    return len(list(re.finditer(pattern, seq)))
+def parse_sequence(value: Any, field: str, row: int) -> str:
+    if pd.isna(value):
+        raise ValueError(f"Row {row}: missing {field}")
+    seq = str(value).strip().upper()
+    invalid = sorted(set(seq) - AA)
+    if not seq or invalid:
+        raise ValueError(f"Row {row}: invalid {field} (empty or noncanonical residues: {invalid})")
+    return seq
 
 
-def count_deamidation_motifs(seq: str) -> int:
-    return seq.count("NG") + seq.count("NS")
+def validate_table(df: pd.DataFrame, label: str, target: str, require_cdr3: bool) -> pd.DataFrame:
+    required = {"Heavy", "cdr3"} | ({"Target"} if label == "reference" else set())
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"{label} missing columns {missing}")
+    if df.empty:
+        raise ValueError(f"{label} is empty")
+    out = df.copy().reset_index(drop=True)
+    if "Target" not in out:
+        out["Target"] = target
+    out["Target"] = out["Target"].astype("string").str.strip()
+    if out["Target"].isna().any() or (out["Target"] == "").any():
+        raise ValueError(f"{label} contains empty Target")
+    if label == "candidate" and (out["Target"] != target).any():
+        raise ValueError("Candidate Target values must match --target exactly")
+    for col in ("Heavy", "cdr3"):
+        out[col] = [parse_sequence(v, col, i + 2) for i, v in enumerate(out[col])]
+    if require_cdr3:
+        bad = out.index[~pd.Series([c in h for h, c in zip(out["Heavy"], out["cdr3"])])].tolist()
+        if bad:
+            raise ValueError(f"{label}: CDR3 is not a substring of Heavy in CSV rows {[i + 2 for i in bad[:10]]}. Disable this check only for a documented alternate representation.")
+    if label == "candidate":
+        if "candidate_name" not in out:
+            out["candidate_name"] = [f"C{i+1}" for i in range(len(out))]
+        if out["candidate_name"].isna().any() or out["candidate_name"].astype(str).str.strip().eq("").any():
+            raise ValueError("Candidate names cannot be empty")
+        if out["candidate_name"].duplicated().any():
+            raise ValueError("Candidate names must be unique")
+        if "binding_probability" in out:
+            bp = pd.to_numeric(out["binding_probability"], errors="coerce")
+            if bp.isna().any() or not np.isfinite(bp.to_numpy()).all() or not bp.between(0, 1).all():
+                raise ValueError("binding_probability must be finite and within [0,1]")
+            out["binding_probability"] = bp.astype(float)
+    return out
 
 
-def count_isomerization_motifs(seq: str) -> int:
-    return sum(seq.count(m) for m in ("DG", "DS", "DT", "DD"))
+def count_overlapping(seq: str, pattern: str) -> int:
+    return sum(re.match(pattern, seq[i:]) is not None for i in range(len(seq)))
 
 
-def count_oxidation_hotspots(seq: str) -> int:
-    return seq.count("M")
-
-
-def count_extra_cys(seq: str, expected_min: int = 2) -> int:
-    return max(0, seq.count("C") - expected_min)
-
-
-def hydrophobic_run_length(seq: str) -> int:
-    longest = 0
-    current = 0
-
-    for aa in seq:
-        if aa in HYDROPHOBIC:
-            current += 1
-            longest = max(longest, current)
-        else:
-            current = 0
-
-    return longest
+def longest_run(seq: str, residues: frozenset[str]) -> int:
+    best = current = 0
+    for a in seq:
+        current = current + 1 if a in residues else 0
+        best = max(best, current)
+    return best
 
 
 def gravy(seq: str) -> float:
-    if not seq:
-        return np.nan
-    return float(np.mean([KD_SCALE[a] for a in seq]))
+    return float(np.mean([KD[a] for a in seq]))
 
 
-def net_charge_at_ph(seq: str, ph: float = 7.4) -> float:
-    if not seq:
-        return np.nan
-
-    def pos_fraction(pka_val: float) -> float:
-        return 1.0 / (1.0 + 10 ** (ph - pka_val))
-
-    def neg_fraction(pka_val: float) -> float:
-        return 1.0 / (1.0 + 10 ** (pka_val - ph))
-
-    charge = 0.0
-    charge += pos_fraction(PKA["Nterm"])
-    charge -= neg_fraction(PKA["Cterm"])
-
+def charge(seq: str, ph: float) -> float:
+    positive = lambda pka: 1 / (1 + 10 ** (ph - pka))
+    negative = lambda pka: 1 / (1 + 10 ** (pka - ph))
+    total = positive(PKA["Nterm"]) - negative(PKA["Cterm"])
     for aa in seq:
-        if aa == "K":
-            charge += pos_fraction(PKA["K"])
-        elif aa == "R":
-            charge += pos_fraction(PKA["R"])
-        elif aa == "H":
-            charge += pos_fraction(PKA["H"])
-        elif aa == "D":
-            charge -= neg_fraction(PKA["D"])
-        elif aa == "E":
-            charge -= neg_fraction(PKA["E"])
-        elif aa == "C":
-            charge -= neg_fraction(PKA["C"])
-        elif aa == "Y":
-            charge -= neg_fraction(PKA["Y"])
-
-    return float(charge)
+        if aa in "KRH":
+            total += positive(PKA[aa])
+        elif aa in "DECY":
+            total -= negative(PKA[aa])
+    return float(total)
 
 
-def estimate_pI(seq: str) -> float:
+def estimate_pi(seq: str) -> float:
     lo, hi = 0.0, 14.0
-
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        charge = net_charge_at_ph(seq, ph=mid)
-
-        if charge > 0:
+    for _ in range(55):
+        mid = (lo + hi) / 2
+        if charge(seq, mid) > 0:
             lo = mid
         else:
             hi = mid
+    return (lo + hi) / 2
 
-    return float(0.5 * (lo + hi))
+
+def window_max(seq: str, func, window: int = 5) -> float:
+    return max(func(seq[i:i + window]) for i in range(max(1, len(seq) - window + 1))) if len(seq) > window else func(seq)
 
 
-def rolling_window_max(seq: str, func, window: int = 5) -> float:
-    if len(seq) == 0:
-        return np.nan
+def fraction(seq: str, residues: frozenset[str]) -> float:
+    return sum(x in residues for x in seq) / len(seq)
 
-    if len(seq) <= window:
-        return func(seq)
 
-    values = [
-        func(seq[i:i + window])
-        for i in range(len(seq) - window + 1)
+def compute_features(heavy: str, cdr3: str, ph: float) -> dict[str, float | int]:
+    o: dict[str, float | int] = {}
+    for prefix, s in (("heavy", heavy), ("cdr3", cdr3)):
+        o.update({
+            f"{prefix}_len": len(s), f"{prefix}_gravy": gravy(s),
+            f"{prefix}_net_charge_pH": charge(s, ph), f"{prefix}_pI": estimate_pi(s),
+            f"{prefix}_hydrophobic_run": longest_run(s, HYDROPHOBIC),
+            f"{prefix}_frac_hydrophobic": fraction(s, HYDROPHOBIC),
+            f"{prefix}_frac_aromatic": fraction(s, AROMATIC),
+            f"{prefix}_frac_positive": fraction(s, POS), f"{prefix}_frac_negative": fraction(s, NEG),
+            f"{prefix}_n_glyco_motifs": count_overlapping(s, r"N[^P][ST]"),
+            f"{prefix}_deamidation_motifs": sum(count_overlapping(s, p) for p in ("NG", "NS")),
+            f"{prefix}_isomerization_motifs": sum(count_overlapping(s, p) for p in ("DG", "DS", "DT", "DD")),
+            f"{prefix}_methionines": s.count("M"), f"{prefix}_cysteines": s.count("C"),
+        })
+    o["cdr3_max_window_gravy_5"] = window_max(cdr3, gravy)
+
+    o["cdr3_max_window_abs_charge_5"] = window_max(cdr3, lambda s: abs(charge(s, ph)))
+    return o
+
+
+def with_features(df: pd.DataFrame, ph: float) -> pd.DataFrame:
+    features = pd.DataFrame([compute_features(h, c, ph) for h, c in zip(df["Heavy"], df["cdr3"])])
+    return pd.concat([df.reset_index(drop=True), features], axis=1)
+
+
+def hard_filter(row: pd.Series, cfg: dict[str, Any]) -> tuple[bool, str]:
+    t = cfg["thresholds"]
+    comparisons = [
+        (not t["cdr3_len_min"] <= row["cdr3_len"] <= t["cdr3_len_max"], "cdr3_length"),
+        (row["cdr3_cysteines"] > t["cdr3_cysteines_max"], "cdr3_cysteines"),
+        (row["cdr3_n_glyco_motifs"] > t["cdr3_n_glyco_motifs_max"], "cdr3_glycosylation_sequon"),
+        (row["cdr3_deamidation_motifs"] > t["cdr3_deamidation_motifs_max"], "cdr3_deamidation_motif"),
+        (row["cdr3_isomerization_motifs"] > t["cdr3_isomerization_motifs_max"], "cdr3_isomerization_motif"),
+        (row["cdr3_hydrophobic_run"] > t["cdr3_hydrophobic_run_max"], "cdr3_hydrophobic_run"),
+        (row["cdr3_gravy"] > t["cdr3_gravy_max"], "cdr3_gravy"),
+        (abs(row["cdr3_net_charge_pH"]) > t["cdr3_abs_charge_max"], "cdr3_charge_proxy"),
+        (row["cdr3_methionines"] > t["cdr3_methionines_max"], "cdr3_methionines"),
     ]
-
-    return float(np.max(values))
-
-
-
-def fit_robust_reference(series: pd.Series) -> Tuple[float, float]:
-    """
-    Fit median and MAD using the reference antibody cohort ONLY.
-    """
-    series = pd.to_numeric(series, errors="coerce").dropna()
-
-    if len(series) == 0:
-        return 0.0, 0.0
-
-    median = float(series.median())
-    mad = float(np.median(np.abs(series - median)))
-
-    return median, mad
+    reasons = [name for failed, name in comparisons if failed]
+    return not reasons, ";".join(reasons)
 
 
-def apply_reference_robust_zscore(
-    series: pd.Series,
-    reference_median: float,
-    reference_mad: float,
-) -> pd.Series:
-    """
-    Apply fixed reference-derived robust normalization.
-
-    z = 0.6745 * (x - median_ref) / MAD_ref
-    """
-    series = pd.to_numeric(series, errors="coerce")
-
-    if reference_mad < 1e-12 or np.isnan(reference_mad):
-        return pd.Series(
-            np.zeros(len(series)),
-            index=series.index,
-            dtype=float,
-        )
-
-    return (
-        0.6745
-        * (series - reference_median)
-        / reference_mad
-    )
+def reference_normalization(reference: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, dict[str, float | str]]:
+    params: dict[str, dict[str, float | str]] = {}
+    for metric in cfg["upper_tail_metrics"] + cfg["two_sided_metrics"]:
+        x = reference[metric].to_numpy(dtype=float)
+        median = float(np.median(x))
+        mad = float(np.median(np.abs(x - median)))
+        if mad > 1e-12:
+            scale, method = mad / 0.67448975, "MAD_normalized"
+        else:
+            iqr = float(np.percentile(x, 75) - np.percentile(x, 25))
+            std = float(np.std(x))
+            if iqr > 1e-12:
+                scale, method = iqr / 1.349, "IQR_normalized"
+            elif std > 1e-12:
+                scale, method = std, "STD"
+            else:
+               
+                scale, method = 1.0, "constant_reference_unit_scale"
+        params[metric] = {"median": median, "scale": float(scale), "method": method}
+    return params
 
 
-def levenshtein(s1: str, s2: str) -> int:
-    if s1 == s2:
-        return 0
+def risk_score(df: pd.DataFrame, params: dict[str, dict[str, float | str]], cfg: dict[str, Any]) -> np.ndarray:
+    scores = np.zeros(len(df), dtype=float)
+    for metric, weight in cfg["motif_weights"].items():
+        scores += float(weight) * df[metric].to_numpy(dtype=float)
+    for metric in cfg["upper_tail_metrics"] + cfg["two_sided_metrics"]:
+        param = params[metric]
+        z = (df[metric].to_numpy(dtype=float) - float(param["median"])) / float(param["scale"])
+        scores += np.abs(z) if metric in cfg["two_sided_metrics"] else np.maximum(z, 0.0)
+    scores += cfg["charge_penalty_weight"] * np.maximum(np.abs(df["cdr3_net_charge_pH"].to_numpy(dtype=float)) - cfg["charge_tolerance"], 0)
+    return scores
 
-    if len(s1) < len(s2):
-        s1, s2 = s2, s1
 
-    previous = list(range(len(s2) + 1))
-
-    for i, c1 in enumerate(s1, start=1):
+def levenshtein(s: str, t: str) -> int:
+    if len(s) < len(t):
+        s, t = t, s
+    previous = list(range(len(t) + 1))
+    for i, a in enumerate(s, 1):
         current = [i]
-
-        for j, c2 in enumerate(s2, start=1):
-            insertion = previous[j] + 1
-            deletion = current[j - 1] + 1
-            substitution = previous[j - 1] + int(c1 != c2)
-
-            current.append(
-                min(insertion, deletion, substitution)
-            )
-
+        for j, b in enumerate(t, 1):
+            current.append(min(previous[j] + 1, current[-1] + 1, previous[j - 1] + (a != b)))
         previous = current
-
     return previous[-1]
 
 
-def normalized_edit_distance(s1: str, s2: str) -> float:
-    denom = max(len(s1), len(s2), 1)
-    return levenshtein(s1, s2) / denom
-
-
-def nearest_neighbor_distance(
-    query_seq: str,
-    ref_seqs: List[str],
-    exclude_identical: bool = True,
-) -> float:
-
-    best = None
-
-    for ref in ref_seqs:
-        if exclude_identical and query_seq == ref:
-            continue
-
-        dist = normalized_edit_distance(query_seq, ref)
-
-        if best is None or dist < best:
-            best = dist
-
-    return np.nan if best is None else float(best)
-
-
-@dataclass
-class DevFeatures:
-    heavy_len: int
-    cdr3_len: int
-
-    heavy_gravy: float
-    cdr3_gravy: float
-
-    heavy_net_charge_pH74: float
-    cdr3_net_charge_pH74: float
-
-    heavy_pI: float
-    cdr3_pI: float
-
-    heavy_hydrophobic_run: int
-    cdr3_hydrophobic_run: int
-
-    heavy_frac_hydrophobic: float
-    cdr3_frac_hydrophobic: float
-
-    heavy_frac_aromatic: float
-    cdr3_frac_aromatic: float
-
-    heavy_frac_positive: float
-    cdr3_frac_positive: float
-
-    heavy_frac_negative: float
-    cdr3_frac_negative: float
-
-    heavy_n_glyco_motifs: int
-    cdr3_n_glyco_motifs: int
-
-    heavy_deamidation_motifs: int
-    cdr3_deamidation_motifs: int
-
-    heavy_isomerization_motifs: int
-    cdr3_isomerization_motifs: int
-
-    heavy_oxidation_m_count: int
-    cdr3_oxidation_m_count: int
-
-    heavy_extra_cys_proxy: int
-    cdr3_extra_cys_proxy: int
-
-    cdr3_max_window_gravy_5: float
-    cdr3_max_window_abs_charge_5: float
-
-
-def compute_features(heavy: str, cdr3: str) -> DevFeatures:
-    heavy = clean_seq(heavy)
-    cdr3 = clean_seq(cdr3)
-
-    def frac(seq: str, aa_set: set) -> float:
-        return (
-            sum(aa in aa_set for aa in seq)
-            / max(len(seq), 1)
-        )
-
-    def abs_charge_local(seq: str) -> float:
-        return abs(net_charge_at_ph(seq, ph=7.4))
-
-    return DevFeatures(
-        heavy_len=len(heavy),
-        cdr3_len=len(cdr3),
-
-        heavy_gravy=gravy(heavy),
-        cdr3_gravy=gravy(cdr3),
-
-        heavy_net_charge_pH74=net_charge_at_ph(heavy, 7.4),
-        cdr3_net_charge_pH74=net_charge_at_ph(cdr3, 7.4),
-
-        heavy_pI=estimate_pI(heavy),
-        cdr3_pI=estimate_pI(cdr3),
-
-        heavy_hydrophobic_run=hydrophobic_run_length(heavy),
-        cdr3_hydrophobic_run=hydrophobic_run_length(cdr3),
-
-        heavy_frac_hydrophobic=frac(heavy, HYDROPHOBIC),
-        cdr3_frac_hydrophobic=frac(cdr3, HYDROPHOBIC),
-
-        heavy_frac_aromatic=frac(heavy, AROMATIC),
-        cdr3_frac_aromatic=frac(cdr3, AROMATIC),
-
-        heavy_frac_positive=frac(heavy, POSITIVE),
-        cdr3_frac_positive=frac(cdr3, POSITIVE),
-
-        heavy_frac_negative=frac(heavy, NEGATIVE),
-        cdr3_frac_negative=frac(cdr3, NEGATIVE),
-
-        heavy_n_glyco_motifs=count_motif_regex(
-            heavy, r"N[^P][ST]"
-        ),
-        cdr3_n_glyco_motifs=count_motif_regex(
-            cdr3, r"N[^P][ST]"
-        ),
-
-        heavy_deamidation_motifs=count_deamidation_motifs(heavy),
-        cdr3_deamidation_motifs=count_deamidation_motifs(cdr3),
-
-        heavy_isomerization_motifs=count_isomerization_motifs(heavy),
-        cdr3_isomerization_motifs=count_isomerization_motifs(cdr3),
-
-        heavy_oxidation_m_count=count_oxidation_hotspots(heavy),
-        cdr3_oxidation_m_count=count_oxidation_hotspots(cdr3),
-
-        heavy_extra_cys_proxy=count_extra_cys(
-            heavy,
-            expected_min=2,
-        ),
-        cdr3_extra_cys_proxy=max(0, cdr3.count("C")),
-
-        cdr3_max_window_gravy_5=rolling_window_max(
-            cdr3,
-            gravy,
-            window=5,
-        ),
-
-        cdr3_max_window_abs_charge_5=rolling_window_max(
-            cdr3,
-            abs_charge_local,
-            window=5,
-        ),
-    )
-
-
-def features_to_dict(features: DevFeatures) -> Dict:
-    return asdict(features)
-
-
-def hard_filter_rule_row(
-    row: pd.Series
-) -> Tuple[bool, List[str]]:
-
-    reasons = []
-
-    if not (
-        ABS_THRESHOLDS["cdr3_len_min"]
-        <= row["cdr3_len"]
-        <= ABS_THRESHOLDS["cdr3_len_max"]
-    ):
-        reasons.append(
-            "CDRH3 length outside allowed range"
-        )
-
-    if (
-        row["cdr3_extra_cys_proxy"]
-        > ABS_THRESHOLDS["extra_cys_cdr3_max"]
-    ):
-        reasons.append(
-            "cysteine present in CDRH3"
-        )
-
-    if (
-        row["cdr3_n_glyco_motifs"]
-        > ABS_THRESHOLDS["n_glyco_motif_cdr3_max"]
-    ):
-        reasons.append(
-            "N-linked glycosylation motif in CDRH3"
-        )
-
-    if (
-        row["cdr3_deamidation_motifs"]
-        > ABS_THRESHOLDS["deamidation_motif_cdr3_max"]
-    ):
-        reasons.append(
-            "excess deamidation motif(s) in CDRH3"
-        )
-
-    if (
-        row["cdr3_isomerization_motifs"]
-        > ABS_THRESHOLDS["isomerization_motif_cdr3_max"]
-    ):
-        reasons.append(
-            "excess Asp isomerization motif(s) in CDRH3"
-        )
-
-    if (
-        row["cdr3_hydrophobic_run"]
-        > ABS_THRESHOLDS["max_hydrophobic_run_cdr3_max"]
-    ):
-        reasons.append(
-            "long hydrophobic run in CDRH3"
-        )
-
-    if (
-        row["cdr3_gravy"]
-        > ABS_THRESHOLDS["gravy_cdr3_max"]
-    ):
-        reasons.append(
-            "high average hydrophobicity in CDRH3"
-        )
-
-    if (
-        abs(row["cdr3_net_charge_pH74"])
-        > ABS_THRESHOLDS["net_charge_cdr3_abs_max"]
-    ):
-        reasons.append(
-            "extreme net charge in CDRH3"
-        )
-
-    if (
-        row["cdr3_oxidation_m_count"]
-        > ABS_THRESHOLDS["oxidation_m_count_cdr3_max"]
-    ):
-        reasons.append(
-            "too many methionine oxidation hotspots in CDRH3"
-        )
-
-    return len(reasons) == 0, reasons
-
-
-
-def reference_cohort_relative_risk_score(
-    df: pd.DataFrame,
-    reference_df: pd.DataFrame,
-) -> pd.Series:
-
-
-    score = pd.Series(
-        np.zeros(len(df)),
-        index=df.index,
-        dtype=float,
-    )
-
-
-    score += 4.0 * df["cdr3_n_glyco_motifs"]
-    score += 2.0 * df["cdr3_deamidation_motifs"]
-    score += 2.0 * df["cdr3_isomerization_motifs"]
-    score += 4.0 * df["cdr3_extra_cys_proxy"]
-    score += 0.75 * df["cdr3_oxidation_m_count"]
-
-  
-
-    outlier_metrics = [
-        "cdr3_gravy",
-        "cdr3_hydrophobic_run",
-        "cdr3_max_window_gravy_5",
-        "cdr3_max_window_abs_charge_5",
-        "cdr3_len",
-        "cdr3_n_glyco_motifs",
-        "cdr3_deamidation_motifs",
-        "cdr3_isomerization_motifs",
-        "cdr3_extra_cys_proxy",
-    ]
-
-    for metric in outlier_metrics:
-
-        ref_median, ref_mad = fit_robust_reference(
-            reference_df[metric]
-        )
-
-        rz = apply_reference_robust_zscore(
-            df[metric],
-            reference_median=ref_median,
-            reference_mad=ref_mad,
-        )
-
+def nearest_distance(seq: str, refs: list[str]) -> float:
+
+    if not refs:
+        raise ValueError("Empty reference list")
+    if seq in refs:
+        return 0.0
+    return float(min(levenshtein(seq, ref) / max(len(seq), len(ref)) for ref in refs))
+
+
+def score_candidates(reference_raw: pd.DataFrame, candidate_raw: pd.DataFrame, target: str, cfg: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    validate_config(cfg)
+    ref_all = validate_table(reference_raw, "reference", target, cfg["require_cdr3_in_heavy"])
+    ref = ref_all.loc[ref_all["Target"] == target].drop_duplicates(subset=["Heavy", "cdr3"]).reset_index(drop=True)
+    if ref.empty:
+        raise ValueError(f"No target-matched reference rows for {target!r}")
+    candidates = validate_table(candidate_raw, "candidate", target, cfg["require_cdr3_in_heavy"])
     
-        score += np.maximum(rz, 0.0).astype(float)
-
-
-    charge_penalty = np.maximum(
-        np.abs(df["cdr3_net_charge_pH74"]) - 2.5,
-        0.0,
-    )
-
-    score += 0.75 * charge_penalty
-
-    return score
-
-
-class DevelopabilityRanker:
-
-    def __init__(self, reference_csv: str):
-        self.reference_csv = reference_csv
-        self.df = pd.read_csv(reference_csv)
-
-        required = ["Target", "Heavy", "cdr3"]
-        missing = [
-            c for c in required
-            if c not in self.df.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Missing required columns in "
-                f"{reference_csv}: {missing}"
-            )
-
-        self.df = self.df[required].dropna().copy()
-
-        self.df["Target"] = self.df["Target"].map(
-            clean_target
-        )
-        self.df["Heavy"] = self.df["Heavy"].map(
-            clean_seq
-        )
-        self.df["cdr3"] = self.df["cdr3"].map(
-            clean_seq
-        )
-
-        self.df = self.df[
-            (self.df["Target"].str.len() > 0)
-            & (self.df["Heavy"].str.len() > 0)
-            & (self.df["cdr3"].str.len() > 0)
-        ].drop_duplicates(
-            subset=["Target", "Heavy", "cdr3"]
-        ).reset_index(drop=True)
-
-    def list_targets(self) -> List[str]:
-        return sorted(
-            self.df["Target"]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-
-    def get_target_cohort(
-        self,
-        target_name: str,
-    ) -> pd.DataFrame:
-
-        target_name = clean_target(target_name)
-
-        cohort = self.df[
-            self.df["Target"] == target_name
-        ].copy()
-
-        if len(cohort) == 0:
-            available = ", ".join(
-                self.list_targets()[:20]
-            )
-
-            raise ValueError(
-                f"No reference cohort found for "
-                f"Target='{target_name}'. "
-                f"Available targets include: {available}"
-            )
-
-        return cohort.reset_index(drop=True)
-
-    def attach_features(
-        self,
-        df: pd.DataFrame,
-    ) -> pd.DataFrame:
-
-        features = [
-            features_to_dict(
-                compute_features(h, c)
-            )
-            for h, c in zip(
-                df["Heavy"],
-                df["cdr3"],
-            )
-        ]
-
-        feature_df = pd.DataFrame(features)
-
-        out = pd.concat(
-            [
-                df.reset_index(drop=True),
-                feature_df.reset_index(drop=True),
-            ],
-            axis=1,
-        )
-
-        pass_values = []
-        reason_values = []
-
-        for _, row in out.iterrows():
-            passed, reasons = hard_filter_rule_row(row)
-
-            pass_values.append(passed)
-            reason_values.append(
-                "; ".join(reasons)
-                if reasons
-                else ""
-            )
-
-        out["hard_filter_pass"] = pass_values
-        out["hard_filter_reasons"] = reason_values
-
-        return out
-
-    def prepare_candidates(
-        self,
-        candidate_df: pd.DataFrame,
-        target_name: str,
-    ) -> pd.DataFrame:
-
-        df = candidate_df.copy()
-
-        if "Target" not in df.columns:
-            df["Target"] = target_name
-
-        if "candidate_name" not in df.columns:
-            df["candidate_name"] = [
-                f"C{i + 1}"
-                for i in range(len(df))
-            ]
-
-        required = [
-            "Target",
-            "Heavy",
-            "cdr3",
-            "candidate_name",
-        ]
-
-        missing = [
-            c for c in required
-            if c not in df.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Missing required candidate columns: "
-                f"{missing}"
-            )
-
-        df = df[
-            required
-            + [
-                c for c in df.columns
-                if c not in required
-            ]
-        ].copy()
-
-        df["Target"] = df["Target"].map(
-            clean_target
-        )
-        df["Heavy"] = df["Heavy"].map(
-            clean_seq
-        )
-        df["cdr3"] = df["cdr3"].map(
-            clean_seq
-        )
-
-        df = df[
-            (df["Heavy"].str.len() > 0)
-            & (df["cdr3"].str.len() > 0)
-        ].reset_index(drop=True)
-
-        return self.attach_features(df)
-
-    def score_candidates(
-        self,
-        target_name: str,
-        candidate_df: pd.DataFrame,
-    ) -> pd.DataFrame:
-
-     
-
-        cohort_df = self.attach_features(
-            self.get_target_cohort(target_name)
-        )
-
-      
-
-        selected_scored = self.prepare_candidates(
-            candidate_df,
-            target_name,
-        )
-
-
-
-        cohort_df = cohort_df.copy()
-
-        cohort_df["developability_risk_score"] = (
-            reference_cohort_relative_risk_score(
-                cohort_df,
-                reference_df=cohort_df,
-            )
-        )
-
- 
-
-        selected_scored[
-            "developability_risk_score"
-        ] = reference_cohort_relative_risk_score(
-            selected_scored,
-            reference_df=cohort_df,
-        )
-
+    ref_features = with_features(ref, cfg["pH"])
+    candidate_features = with_features(candidates, cfg["pH"])
+    normalization = reference_normalization(ref_features, cfg)
+    ref_scores = risk_score(ref_features, normalization, cfg)
+    candidate_features["developability_risk_score"] = risk_score(candidate_features, normalization, cfg)
+    passes = [hard_filter(row, cfg) for _, row in candidate_features.iterrows()]
+    candidate_features["hard_filter_pass"] = [p[0] for p in passes]
+    candidate_features["hard_filter_reasons"] = [p[1] for p in passes]
   
-
-        risk_ref = (
-            cohort_df["developability_risk_score"]
-            .dropna()
-            .values
-        )
-
-       
-
-        heavy_refs = cohort_df["Heavy"].tolist()
-        cdr3_refs = cohort_df["cdr3"].tolist()
-
-        selected_scored[
-            "heavy_nn_edit_distance"
-        ] = selected_scored["Heavy"].map(
-            lambda x: nearest_neighbor_distance(
-                x,
-                heavy_refs,
-                exclude_identical=True,
-            )
-        )
-
-        selected_scored[
-            "cdr3_nn_edit_distance"
-        ] = selected_scored["cdr3"].map(
-            lambda x: nearest_neighbor_distance(
-                x,
-                cdr3_refs,
-                exclude_identical=True,
-            )
-        )
+    sorted_ref_scores = np.sort(ref_scores)
+    candidate_features["developability_risk_score_percentile"] = 100 * np.searchsorted(sorted_ref_scores, candidate_features["developability_risk_score"].to_numpy(dtype=float), side="right") / len(sorted_ref_scores)
+    h_refs = list(ref["Heavy"].unique())
+    c_refs = list(ref["cdr3"].unique())
+    candidate_features["heavy_nn_edit_distance"] = [nearest_distance(s, h_refs) for s in candidate_features["Heavy"]]
+    candidate_features["cdr3_nn_edit_distance"] = [nearest_distance(s, c_refs) for s in candidate_features["cdr3"]]
+    candidate_features["low_sequence_risk_flag"] = candidate_features["hard_filter_pass"] & (candidate_features["developability_risk_score_percentile"] <= cfg["risk_percentile_max"])
+    candidate_features["sequence_novelty_flag"] = (candidate_features["heavy_nn_edit_distance"] >= cfg["heavy_novelty_min"]) | (candidate_features["cdr3_nn_edit_distance"] >= cfg["cdr3_novelty_min"])
+    candidate_features["joint_priority_flag"] = candidate_features["low_sequence_risk_flag"] & candidate_features["sequence_novelty_flag"]
+   
+    sort_cols = ["joint_priority_flag", "low_sequence_risk_flag", "hard_filter_pass"]
+    ascending = [False] * len(sort_cols)
+    if "binding_probability" in candidate_features:
+        sort_cols.append("binding_probability")
+        ascending.append(False)
+    sort_cols += ["developability_risk_score", "cdr3_nn_edit_distance", "candidate_name"]
+    ascending += [True, False, True]
+    candidate_features = candidate_features.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
+    candidate_features.insert(0, "rank", np.arange(1, len(candidate_features) + 1))
+    meta = {
+        "target": target, "reference_n_raw_target": int((ref_all["Target"] == target).sum()),
+        "reference_n_unique": len(ref), "candidate_n": len(candidates),
+        "reference_score_summary": {"min": float(ref_scores.min()), "median": float(np.median(ref_scores)), "max": float(ref_scores.max())},
+        "reference_normalization": normalization,
+        "counts": {name: int(candidate_features[name].sum()) for name in ("hard_filter_pass", "low_sequence_risk_flag", "sequence_novelty_flag", "joint_priority_flag")},
+        "sorting": {"columns": sort_cols, "ascending": ascending},
+        "interpretation": "Heuristic reference-relative sequence ranking only; flags are NOT experimental developability or efficacy claims.",
+    }
+    return candidate_features, meta
 
 
-        selected_scored[
-            "developability_risk_score_percentile"
-        ] = selected_scored[
-            "developability_risk_score"
-        ].map(
-            lambda x: (
-                100.0 * (risk_ref <= x).mean()
-                if len(risk_ref)
-                else np.nan
-            )
-        )
-
-    
-
-        selected_scored["low_risk_claim"] = (
-            selected_scored["hard_filter_pass"]
-            & (
-                selected_scored[
-                    "developability_risk_score_percentile"
-                ] <= 50.0
-            )
-        )
-
-
-
-        selected_scored["high_diversity_claim"] = (
-            (
-                selected_scored[
-                    "heavy_nn_edit_distance"
-                ] >= 0.10
-            )
-            |
-            (
-                selected_scored[
-                    "cdr3_nn_edit_distance"
-                ] >= 0.20
-            )
-        )
-
-        selected_scored["overall_claim"] = (
-            selected_scored["low_risk_claim"]
-            & selected_scored["high_diversity_claim"]
-        )
-
-
-        sort_cols = [
-            "overall_claim",
-            "low_risk_claim",
-            "hard_filter_pass",
-        ]
-
-        if "binding_probability" in selected_scored.columns:
-            sort_cols.append(
-                "binding_probability"
-            )
-
-        sort_cols += [
-            "developability_risk_score",
-            "cdr3_nn_edit_distance",
-        ]
-
-        ascending = [
-            False,
-            False,
-            False,
-        ]
-
-        if "binding_probability" in selected_scored.columns:
-            ascending.append(False)
-
-        ascending += [
-            True,
-            False,
-        ]
-
-        selected_scored = selected_scored.sort_values(
-            by=sort_cols,
-            ascending=ascending,
-        ).reset_index(drop=True)
-
-        selected_scored.insert(
-            0,
-            "rank",
-            range(1, len(selected_scored) + 1),
-        )
-
-        return selected_scored
-
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run strict reference-cohort-relative "
-            "developability screening and ranking."
-        )
-    )
-
-    parser.add_argument(
-        "--reference_csv",
-        required=True,
-        help=(
-            "Reference antibody CSV containing "
-            "Target, Heavy and cdr3 columns."
-        ),
-    )
-
-    parser.add_argument(
-        "--candidate_csv",
-        required=True,
-        help=(
-            "Candidate antibody CSV containing "
-            "Heavy and cdr3 columns."
-        ),
-    )
-
-    parser.add_argument(
-        "--target",
-        required=True,
-        help=(
-            "Target name used to select the "
-            "antigen-matched reference cohort."
-        ),
-    )
-
-    parser.add_argument(
-        "--output_csv",
-        default="developability_scores_reference_relative.csv",
-        help="Output CSV file.",
-    )
-
-    args = parser.parse_args()
-
-    ranker = DevelopabilityRanker(
-        args.reference_csv
-    )
-
-    candidates = pd.read_csv(
-        args.candidate_csv
-    )
-
-    scored = ranker.score_candidates(
-        target_name=args.target,
-        candidate_df=candidates,
-    )
-
-    output_path = Path(
-        args.output_csv
-    )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    scored.to_csv(
-        output_path,
-        index=False,
-    )
-
-    print("=" * 70)
-    print("STRICT REFERENCE-COHORT-RELATIVE SCORING")
-    print("=" * 70)
-    print(f"Target: {args.target}")
-    print(f"Candidates scored: {len(scored)}")
-    print(f"Output: {output_path}")
-
-    if len(scored):
-        print(
-            "Risk score range:",
-            scored["developability_risk_score"].min(),
-            "to",
-            scored["developability_risk_score"].max(),
-        )
-
-        print(
-            "Risk percentile range:",
-            scored[
-                "developability_risk_score_percentile"
-            ].min(),
-            "to",
-            scored[
-                "developability_risk_score_percentile"
-            ].max(),
-        )
-
-        print(
-            "Hard-filter pass:",
-            int(scored["hard_filter_pass"].sum()),
-            "/",
-            len(scored),
-        )
-
-        print(
-            "Low-risk:",
-            int(scored["low_risk_claim"].sum()),
-            "/",
-            len(scored),
-        )
-
-    print("=" * 70)
-
-    print(
-        scored.head(10).to_string(
-            index=False
-        )
-    )
+def cli() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--reference_csv", type=Path)
+    p.add_argument("--candidate_csv", type=Path)
+    p.add_argument("--target")
+    p.add_argument("--output_csv", type=Path, default=Path("developability_ranked.csv"))
+    p.add_argument("--config_json", type=Path, help="Full JSON config. Generate the default with --write_default_config.")
+    p.add_argument("--write_default_config", type=Path, help="Write default config JSON and exit")
+    p.add_argument("--log_level", choices=["DEBUG", "INFO", "WARNING"], default="INFO")
+    args = p.parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
+    if args.write_default_config:
+        args.write_default_config.parent.mkdir(parents=True, exist_ok=True)
+        args.write_default_config.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {args.write_default_config}")
+        return
+    if not all((args.reference_csv, args.candidate_csv, args.target)):
+        p.error("--reference_csv, --candidate_csv and --target are required for scoring")
+    cfg = json.loads(args.config_json.read_text(encoding="utf-8")) if args.config_json else DEFAULT_CONFIG
+    validate_config(cfg)
+    for path in (args.reference_csv, args.candidate_csv):
+        if not path.is_file():
+            p.error(f"Input not found: {path}")
+    ranked, meta = score_candidates(pd.read_csv(args.reference_csv), pd.read_csv(args.candidate_csv), args.target, cfg)
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    ranked.to_csv(args.output_csv, index=False, float_format="%.10g")
+    meta.update({
+        "utc_created": datetime.now(timezone.utc).isoformat(), "python": platform.python_version(),
+        "numpy": np.__version__, "pandas": pd.__version__, "config": cfg,
+        "reference_file_sha256": sha256(args.reference_csv),
+        "candidate_file_sha256": sha256(args.candidate_csv),
+    })
+    metadata_path = args.output_csv.with_suffix(".metadata.json")
+    metadata_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    LOG.info("Target=%s reference_unique=%d candidates=%d", args.target, meta["reference_n_unique"], meta["candidate_n"])
+    LOG.info("Hard-filter pass=%d joint priority=%d", meta["counts"]["hard_filter_pass"], meta["counts"]["joint_priority_flag"])
+    LOG.info("Wrote %s and %s", args.output_csv, metadata_path)
 
 
 if __name__ == "__main__":
-    main()
-PY
+    cli()
